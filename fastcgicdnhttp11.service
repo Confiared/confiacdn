@@ -1,0 +1,15 @@
+[Unit]
+Description=fastcgicdnhttp11 Confiared service
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=www-data
+ExecStart=/usr/bin/fastcgicdn --flatcache
+WorkingDirectory=/var/lib/fastcgicdn
+
+[Install]
+WantedBy=multi-user.target
