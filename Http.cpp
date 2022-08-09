@@ -75,12 +75,12 @@ Http::Http(const int &cachefd, //0 if no old cache file found
     endDetected=false;
     fileMoved=false;
     streamingDetected=false;
-    lastReceivedBytesTimestamps=Backend::currentTime();
+    lastReceivedBytesTimestamps=Backend::msFrom1970();
     #ifdef DEBUGFASTCGI
     if(&pathToHttpList()==&Http::pathToHttp)
-        std::cerr << "contructor http " << this << " uri: " << uri << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+        std::cerr << "contructor http " << this << " uri: " << uri << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << ": " << __FILE__ << ":" << __LINE__ << std::endl;
     else
-        std::cerr << "contructor https " << this << " uri: " << uri << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+        std::cerr << "contructor https " << this << " uri: " << uri << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << ": " << __FILE__ << ":" << __LINE__ << std::endl;
     if(cachePath.empty())
     {
         std::cerr << "critical error cachePath.empty() " << this << " uri: " << uri << ": " << __FILE__ << ":" << __LINE__ << std::endl;
@@ -145,6 +145,7 @@ Http::~Http()
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
+        status=Status_Idle;
     }
 
     delete tempCache;
@@ -225,7 +226,7 @@ bool Http::tryConnect(const std::string &host, const std::string &uri, const boo
     this->uri=uri;
     this->etagBackend=etag;
 
-    if(!Dns::dns->get(this,host,&pathToHttp!=&pathToHttpList()))
+    if(!Dns::dns->getAAAA(this,host,&pathToHttp!=&pathToHttpList()))
     {
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN dns overloaded" << std::endl;
@@ -240,6 +241,15 @@ bool Http::tryConnect(const std::string &host, const std::string &uri, const boo
 
 void Http::dnsError()
 {
+    if(status!=Status_WaitDns)
+    {
+        /*std::cerr << "Http::dnsRight() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
+        abort();*/
+        //now it's just a warning
+        std::cerr << "Http::dnsRight() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
+        return;
+    }
+    status=Status_WaitTheContent;
     #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
     #endif
@@ -250,6 +260,15 @@ void Http::dnsError()
 
 void Http::dnsWrong()
 {
+    if(status!=Status_WaitDns)
+    {
+        /*std::cerr << "Http::dnsRight() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
+        abort();*/
+        //now it's just a warning
+        std::cerr << "Http::dnsRight() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
+        return;
+    }
+    status=Status_WaitTheContent;
     #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
     #endif
@@ -262,9 +281,18 @@ void Http::dnsRight(const sockaddr_in6 &sIPv6)
 {
     if(status!=Status_WaitDns)
     {
-        std::cerr << "Http::dnsRight() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
-        abort();
+        /*std::cerr << "Http::dnsRight() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
+        abort();*/
+        //now it's just a warning
+        std::cerr << "Http::dnsRight() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
+        return;
     }
+    lastReceivedBytesTimestamps=Backend::msFrom1970();
+    #ifdef DEBUGFASTCGI
+    char str[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &sIPv6.sin6_addr, str, INET6_ADDRSTRLEN);
+    std::cerr << this << ": Http::dnsRight() " << host << ": " << str << " url: " << getUrl() << " " << __FILE__ << ":" << __LINE__ << std::endl;
+    #endif
     status=Status_WaitTheContent;
     #ifdef DEBUGFASTCGI
     m_socket=sIPv6;
@@ -280,6 +308,11 @@ bool Http::tryConnectInternal(const sockaddr_in6 &s)
         abort();
     }
     bool connectInternal=false;
+    #ifdef DEBUGFASTCGI
+    char str[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &s, str, INET6_ADDRSTRLEN);
+    std::cerr << this << ": Http::tryConnectInternal " << host << ": " << str << " url: " << getUrl() << " " << __FILE__ << ":" << __LINE__ << std::endl;
+    #endif
     backend=Backend::tryConnectHttp(s,this,connectInternal,&backendList);
     if(backend==nullptr)
     {
@@ -357,7 +390,7 @@ bool Http::tryConnectInternal(const sockaddr_in6 &s)
                 host=str;
             if (inet_ntop(AF_INET6, &m_socket.sin6_addr, str, INET6_ADDRSTRLEN) != NULL)
                 host2=str;
-            std::cerr << this << " backend==nullptr and no backend list found, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << host << " " << host2 << " (abort) " << __FILE__ << ":" << __LINE__ << std::endl;
+            std::cerr << this << " backend==nullptr into tryConnectInternal(), put in queue?, backendList: " << backendList << ", isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << host << " " << host2 << " (abort) " << __FILE__ << ":" << __LINE__ << std::endl;
             abort();
         }
         #endif
@@ -386,6 +419,16 @@ void Http::resetRequestSended()
     chunkLength=-1;
 }
 
+bool Http::get_requestSended()
+{
+    return requestSended;
+}
+
+bool Http::get_status()
+{
+    return status;
+}
+
 void Http::sendRequest()
 {
     if(status!=Status_WaitTheContent)
@@ -394,13 +437,13 @@ void Http::sendRequest()
         abort();
     }
     //reset lastReceivedBytesTimestamps when come from busy to pending
-    lastReceivedBytesTimestamps=Backend::currentTime();
+    lastReceivedBytesTimestamps=Backend::msFrom1970();
 
     #ifdef DEBUGFASTCGI
     struct timeval tv;
     gettimeofday(&tv,NULL);
     std::cerr << "[" << tv.tv_sec << "] ";
-    std::cerr << "Http::sendRequest() " << this << " " << __FILE__ << ":" << __LINE__ << " uri: " << uri << std::endl;
+    std::cerr << "Http::sendRequest() " << this << " " << __FILE__ << ":" << __LINE__ << " uri: " << uri << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << std::endl;
     if(uri.empty())
     {
         std::cerr << "Http::readyToWrite(): but uri.empty()" << std::endl;
@@ -468,11 +511,14 @@ void Http::readyToRead()
 
     if(backend!=nullptr && /*if file end send*/ endDetected)
     {
-        #ifdef DEBUGFASTCGI
-        std::cerr << "Received data while not connected to http" << std::endl;
-        #endif
-        while(socketRead(Http::buffer,sizeof(Http::buffer))>0)
-        {}
+        int size=socketRead(Http::buffer,sizeof(Http::buffer));
+        while(size>0)
+        {
+            #ifdef DEBUGFASTCGI
+            std::cerr << this << " Received data while not connected to http " << __FILE__ << ":" << __LINE__ << " data: " << Common::binarytoHexa(buffer,size) << std::endl;
+            #endif
+            size=socketRead(Http::buffer,sizeof(Http::buffer));
+        }
         return;
     }
 
@@ -503,8 +549,8 @@ void Http::readyToRead()
                 std::cerr << "Http::readyToRead() status!=Status_WaitTheContent " << __FILE__ << ":" << __LINE__ << std::endl;
                 abort();
             }
-            lastReceivedBytesTimestamps=Backend::currentTime();
-            //std::cout << "Stream block: " << Common::binarytoHexa(buffer,size) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            lastReceivedBytesTimestamps=Backend::msFrom1970();
+            std::cout << "Stream block: " << Common::binarytoHexa(buffer,size) << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << " " << __FILE__ << ":" << __LINE__ << std::endl;
             if(parsing==Parsing_Content)
             {
                 write(buffer,size);
@@ -533,7 +579,7 @@ void Http::readyToRead()
                                 c=0x00;
                                 http_code=atoi((char *)fh);
                                 #ifdef DEBUGFASTCGI
-                                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " http code: " << http_code << std::endl;
+                                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " http code: " << http_code << " (" << fh << ") headerBuff.empty(): " << std::to_string(headerBuff.empty()) << " data: " << Common::binarytoHexa(buffer,size) << std::endl;
                                 #endif
                                 if(backend!=nullptr)
                                     backend->wasTCPConnected=true;
@@ -1603,6 +1649,9 @@ void Http::flushRead()
 
 void Http::parseNonHttpError(const Backend::NonHttpError &error)
 {
+    #ifdef DEBUGFASTCGI
+    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " error: " << (int)error << std::endl;
+    #endif
     switch(error)
     {
         case Backend::NonHttpError_AlreadySend:
@@ -2036,11 +2085,15 @@ void Http::disconnectBackend(const bool fromDestructor)
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
+        status=Status_Idle;
     }
     host.clear();
     uri.clear();
     etagBackend.clear();
-    lastReceivedBytesTimestamps=0;
+    //lastReceivedBytesTimestamps=0;
+    #ifdef DEBUGFASTCGI
+    std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << std::endl;
+    #endif
     requestSended=false;
     endDetected=false;
     fileMoved=false;
@@ -2742,10 +2795,15 @@ void Http::checkBackend()
                 break;
             }
             if(backend==nullptr)
-                std::cerr << this << " http backend: nullptr and no backend list found, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << host << " (abort)" << std::endl;
+            {
+                if(status!=Status_WaitDns)
+                    std::cerr << this << " http backend: nullptr and no backend list found, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << host << " put in queue: " << getUrl() << " status: " << (int)status << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            }
             else
-                std::cerr << this << " http backend: " << backend << " and no backend list found, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << host << " (abort)" << std::endl;
-            //abort();
+            {
+                std::cerr << this << " http backend: " << backend << " and no backend list found, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << host << " status: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
+                //abort();
+            }
         }
     }
 }
@@ -2754,9 +2812,12 @@ void Http::checkBackend()
 //return true if timeout
 bool Http::detectTimeout()
 {
-    const uint64_t msFrom1970=Backend::currentTime();
+    const uint64_t msFrom1970=Backend::msFrom1970();
     unsigned int secondForTimeout=5;
-    if(pending)
+    if(status==Status_WaitDns)
+        //timeout * server count * try
+        secondForTimeout=Dns::dns->queryDNSTimeout()*Dns::dns->serverCount()*Dns::dns->retryBeforeError();
+    else if(pending)
     {
         if(requestSended)
             secondForTimeout=30;
@@ -2785,11 +2846,14 @@ bool Http::detectTimeout()
     }
     if(endDetected && !clientsList.empty())
         return false;
-    lastReceivedBytesTimestamps=msFrom1970;//prevent dual Http::detectTimeout()
     if(backend!=nullptr)
-        std::cerr << std::to_string(msFrom1970/1000) << "/" << std::to_string(lastReceivedBytesTimestamps) << " Http::detectTimeout() need to quit " << this << " and quit backend " << (void *)backend << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << std::endl;
+        std::cerr << std::to_string(msFrom1970) << "/" << std::to_string(lastReceivedBytesTimestamps) << " Http::detectTimeout() need to quit " << this << " and quit backend " << (void *)backend << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << " url: " << getUrl() << std::endl;
     else
-        std::cerr << std::to_string(msFrom1970/1000) << "/" << std::to_string(lastReceivedBytesTimestamps) << " Http::detectTimeout() need to quit " << this << " " << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << std::endl;
+        std::cerr << std::to_string(msFrom1970) << "/" << std::to_string(lastReceivedBytesTimestamps) << " Http::detectTimeout() need to quit " << this << " " << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << " url: " << getUrl() << std::endl;
+    #ifdef DEBUGFASTCGI
+    const auto oldlastReceivedBytesTimestamps=lastReceivedBytesTimestamps;
+    #endif
+    lastReceivedBytesTimestamps=msFrom1970;//prevent dual Http::detectTimeout()
     if(tempCache!=nullptr)
         std::cerr << "Http::detectTimeout() tempCache: " << tempCache << " fd: " << tempCache->getFD() << " " << __FILE__ << ":" << __LINE__ << std::endl;
 
@@ -2809,6 +2873,16 @@ bool Http::detectTimeout()
     }
 
     //if no byte received into 600s (10m)
+    #ifdef DEBUGFASTCGI
+    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " timeout details: " << oldlastReceivedBytesTimestamps << "<(" << msFrom1970 << "-" << secondForTimeout << "*1000), pending: " << pending << " requestSended: " << requestSended << " etagBackend.empty(): " << etagBackend.empty();
+    if(backend!=nullptr)
+    {
+        std::cerr << " backend: " << backend;
+        if(backend->backendList!=nullptr)
+            std::cerr << " backend->backendList: " << backend << " backend->backendList->pending.size(): " << backend->backendList->pending.size();
+    }
+    std::cerr << std::endl;
+    #endif
     parseNonHttpError(Backend::NonHttpError_Timeout);
     /*do into disconnectFrontend(true):
     for(Client * client : clientsList)

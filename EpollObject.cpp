@@ -28,7 +28,7 @@ const EpollObject::Kind &EpollObject::getKind() const
     return kind;
 }
 
-int EpollObject::getFD()
+int EpollObject::getFD() const
 {
     return fd;
 }

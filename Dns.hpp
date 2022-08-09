@@ -12,6 +12,7 @@
 #define CACHETIMEDIVIDER 1
 //should be power of 2
 #define MAXDNSSERVER 16
+//#define PARALLELQUERIES
 
 class Http;
 class DnsSocket;
@@ -33,9 +34,15 @@ public:
     int requestCountMerged();
     void cleanCache();
     void checkQueries();
+    uint8_t serverCount() const;
+    uint8_t retryBeforeError() const;
+    uint8_t queryDNSTimeout() const;
     static Dns *dns;
     std::string getQueryList() const;
     int get_httpInProgress() const;
+    #ifdef DEBUGDNS
+    void checkCorruption();
+    #endif
     static const unsigned char include[];
     static const unsigned char exclude[];
 private:
@@ -70,7 +77,7 @@ private:
     std::vector<DnsServerEntry> dnsServerList;
     uint8_t lastDnsFailed;//255 if no server dns failed
     //to put on last try the dns server with problem
-    uint8_t preferedServerOrder[MAXDNSSERVER];
+    uint8_t preferedServerOrder[MAXDNSSERVER];//if MAXDNSSERVER <=16 then lower memory on 64Bits system than std::vector (std::vector memory = 16bytes + X entry 1Byte/8Bits)
     uint16_t increment;
 
     struct Query {
@@ -81,7 +88,7 @@ private:
         uint8_t retryTime;
         uint64_t nextRetry;
         std::string query;
-        uint8_t serverOrder[MAXDNSSERVER];
+        uint8_t serverOrder[MAXDNSSERVER];//if MAXDNSSERVER <=16 then lower memory on 64Bits system than std::vector (std::vector memory = 16bytes + X entry 1Byte/8Bits)
     };
     int httpInProgress;
     void addQuery(const uint16_t &id,const Query &query);

@@ -19,6 +19,14 @@ public:
     Http(const int &cachefd,//0 if no old cache file found
          const std::string &cachePath,Client *client);
     virtual ~Http();
+
+    enum Status : uint8_t
+    {
+        Status_Idle=0x00,
+        Status_WaitDns=0x01,
+        Status_WaitTheContent=0x02,
+    };
+
     bool tryConnect(const std::string &host, const std::string &uri, const bool &gzip, const std::string &etagBackend=std::string());
     virtual bool tryConnectInternal(const sockaddr_in6 &s);
     void parseEvent(const epoll_event &event);
@@ -37,6 +45,8 @@ public:
     bool removeClient(Client * client);
     const std::string &getCachePath() const;
     void resetRequestSended();
+    bool get_requestSended();
+    bool get_status();
     bool haveUrlAndFrontendConnected() const;
     bool isAlive() const;
     bool isWithClient() const;
@@ -107,12 +117,6 @@ private:
         Parsing_Content
     };
     Parsing parsing;
-    enum Status : uint8_t
-    {
-        Status_Idle=0x00,
-        Status_WaitDns=0x01,
-        Status_WaitTheContent=0x02,
-    };
     Status status;
 
     std::string etagBackend;

@@ -77,7 +77,7 @@ Client::Client(int cfd) :
     std::cerr << __FILE__ << ":" << __LINE__ << " Client::Client() " << this << " fd: " << fd << " this->fd: " << this->fd << " constructor" << std::endl;
     #endif
     clients.insert(this);
-    creationTime=Backend::currentTime();
+    creationTime=Backend::msFrom1970();
     #ifdef DEBUGFASTCGI
     toDebug.insert(this);
     #endif
@@ -756,7 +756,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
         #endif
         std::string reply("X-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\n");
         reply+="Current time: ";
-        reply+=std::to_string(Backend::currentTime());
+        reply+=std::to_string(Backend::msFrom1970());
         reply+="\r\n";
         reply+="Dns ("+std::to_string(Dns::dns->get_httpInProgress())+"): ";
         reply+=Dns::dns->getQueryList();
@@ -2094,7 +2094,7 @@ bool Client::detectTimeout()
     #endif
     if(fullyParsed)
         return false;
-    const uint64_t msFrom1970=Backend::currentTime();
+    const uint64_t msFrom1970=Backend::msFrom1970();
     if(creationTime>(msFrom1970-5000))
     {
         //prevent time drift

@@ -49,9 +49,10 @@ public:
     bool tryConnectInternal(const sockaddr_in6 &s);
     static std::unordered_map<std::string/*128Bits/16Bytes IPv6 encoded*/,BackendList *> addressToHttp;
     static std::unordered_map<std::string/*128Bits/16Bytes IPv6 encoded*/,BackendList *> addressToHttps;
-    static uint64_t currentTime();//ms from 1970
+    static uint64_t msFrom1970();//ms from 1970
     bool detectTimeout();
     std::string getQuery() const;
+    void startNextPending();
 
     void readyToWrite();
     ssize_t socketRead(void *buffer, size_t size);
@@ -69,7 +70,7 @@ public:
     bool wasTCPConnected;
     const static SSL_METHOD *meth;
 private:
-    uint64_t lastReceivedBytesTimestamps;
+    uint64_t lastReceivedBytesmsTimestamps;
     std::string bufferSocket;
 
 public:

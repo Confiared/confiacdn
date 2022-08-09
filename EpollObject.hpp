@@ -24,7 +24,7 @@ public:
     virtual void parseEvent(const epoll_event &event) = 0;
     const Kind &getKind() const;
     void workAroundBug();
-    int getFD();
+    int getFD() const;
 protected:
     int fd;
     Kind kind;

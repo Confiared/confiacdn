@@ -39,14 +39,7 @@ Dns::Dns()
     IPv6Socket=nullptr;
 
     lastDnsFailed=255;
-    {
-        int index=0;
-        while(index<MAXDNSSERVER)
-        {
-            preferedServerOrder[index]=index;
-            index++;
-        }
-    }
+    uint8_t indexPreferedServerOrder=0;
 
     /*memset(&targetDnsIPv6, 0, sizeof(targetDnsIPv6));
     targetDnsIPv6.sin6_port = htobe16(53);
@@ -111,6 +104,8 @@ Dns::Dns()
                         memset(&e.targetDnsIPv6,0,sizeof(e.targetDnsIPv6));
                         e.lastFailed=0;
                         dnsServerList.push_back(e);
+                        preferedServerOrder[indexPreferedServerOrder]=indexPreferedServerOrder;
+                        indexPreferedServerOrder++;
 
                         #ifdef DEBUGDNS
                         char str[INET_ADDRSTRLEN];
@@ -129,6 +124,8 @@ Dns::Dns()
                     memset(&e.targetDnsIPv4,0,sizeof(e.targetDnsIPv4));
                     e.lastFailed=0;
                     dnsServerList.push_back(e);
+                    preferedServerOrder[indexPreferedServerOrder]=indexPreferedServerOrder;
+                    indexPreferedServerOrder++;
 
                     #ifdef DEBUGDNS
                     char str[INET6_ADDRSTRLEN];
@@ -143,6 +140,11 @@ Dns::Dns()
         fclose(fp);
         if (line)
             free(line);
+    }
+    while(indexPreferedServerOrder<MAXDNSSERVER)
+    {
+        preferedServerOrder[indexPreferedServerOrder]=0;
+        indexPreferedServerOrder++;
     }
 
     if(dnsServerList.empty())
@@ -226,6 +228,9 @@ bool Dns::tryOpenSocket()
 
 void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
 {
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
     if(event.events & EPOLLIN)
     {
         int size = 0;
@@ -255,14 +260,14 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                 std::cerr << "Dns::parseEvent() unknown socket" << std::endl;
                 return;
             }
-            #ifdef DEBUGDNS
-            std::cerr << __FILE__ << ":" << __LINE__ << " dns reply" << std::endl;
-            #endif
 
             int pos=0;
             uint16_t transactionId=0;
             if(!read16BitsRaw(transactionId,buffer,size,pos))
                 return;
+            #ifdef DEBUGDNS
+            std::cerr << __FILE__ << ":" << __LINE__ << " dns reply for " << transactionId << std::endl;
+            #endif
             uint16_t flags=0;
             if(!read16Bits(flags,buffer,size,pos))
                 return;
@@ -292,17 +297,42 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
             if(classIn!=0x0001)
                 return;
 
-
+            #ifdef DEBUGDNS
+            checkCorruption();
+            #endif
             //answers list
             if(queryList.find(transactionId)!=queryList.cend())
             {
-                if(httpInProgress>0)
-                    httpInProgress--;
                 const Query &q=queryList.at(transactionId);
-                const DnsServerEntry &dnsServer=dnsServerList.at(q.retryTime%dnsServerList.size());
+
+                #ifndef PARALLELQUERIES
+                const uint8_t &indexServerOrder=q.retryTime%dnsServerList.size();
+                #ifdef DEBUGDNS
+                if(indexServerOrder>=dnsServerList.size())
+                {
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << std::to_string(q.retryTime%dnsServerList.size()) << ">=" << dnsServerList.size() << " (abort)" << std::endl;
+                    abort();
+                }
+                if(indexServerOrder>=sizeof(q.serverOrder))
+                {
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << std::to_string(q.retryTime%dnsServerList.size()) << ">=" << sizeof(q.serverOrder) << " (abort)" << std::endl;
+                    abort();
+                }
+                #endif
+                const uint8_t &indexDns=q.serverOrder[indexServerOrder];
+                #ifdef DEBUGDNS
+                if(indexDns>=dnsServerList.size())
+                {
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << std::to_string(q.retryTime%dnsServerList.size()) << ">=" << dnsServerList.size() << " (abort)" << std::endl;
+                    abort();
+                }
+                #endif
+                const DnsServerEntry &dnsServer=dnsServerList.at(indexDns);
+                #endif
 
                 if(socket==IPv6Socket)
                 {
+                    #ifndef PARALLELQUERIES
                     if(dnsServer.mode!=Mode_IPv6)
                     {
                         #ifdef DEBUGDNS
@@ -318,13 +348,53 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                         inet_ntop(AF_INET6, &dnsServer.targetDnsIPv6.sin6_addr, str, INET6_ADDRSTRLEN);
                         char str2[INET6_ADDRSTRLEN];
                         inet_ntop(AF_INET6, &si_other6.sin6_addr, str2, INET6_ADDRSTRLEN);
-                        std::cerr << str << "!=" << str2 << std::endl;
+                        std::cerr << str << "!=" << str2 << " for " << transactionId << " " << std::to_string(q.retryTime) << "%" << dnsServerList.size() << std::endl;
+                        std::cerr << "dnsServerList index: [";
+                        unsigned int index=0;
+                        while(index<dnsServerList.size())
+                        {
+                            if(index!=0)
+                                std::cerr << ",";
+                            std::cerr << std::to_string(preferedServerOrder[index]);
+                            index++;
+                        }
+                        std::cerr << "] and [";
+                        index=0;
+                        while(index<dnsServerList.size())
+                        {
+                            if(index!=0)
+                                std::cerr << ",";
+                            std::cerr << std::to_string(q.serverOrder[index]);
+                            index++;
+                        }
+                        std::cerr << "]";
+                        std::cerr << std::endl;
                         #endif
                         return;
                     }
+                    #else
+                    unsigned int index=0;
+                    while(index<dnsServerList.size())
+                    {
+                        const DnsServerEntry &dnsServer=dnsServerList.at(index);
+                        if(dnsServer.mode==Mode_IPv6 && memcmp(&dnsServer.targetDnsIPv6.sin6_addr,&si_other6.sin6_addr,16)==0)
+                            break;
+                        index++;
+                    }
+                    if(index>=dnsServerList.size())
+                    {
+                        #ifdef DEBUGDNS
+                        char str2[INET6_ADDRSTRLEN];
+                        inet_ntop(AF_INET6, &si_other6.sin6_addr, str2, INET6_ADDRSTRLEN);
+                        std::cerr << str2 << " unknow source for " << transactionId << " " << std::to_string(q.retryTime) << "%" << dnsServerList.size() << std::endl;
+                        #endif
+                        return;
+                    }
+                    #endif
                 }
                 else
                 {
+                    #ifndef PARALLELQUERIES
                     if(dnsServer.mode!=Mode_IPv4)
                     {
                         #ifdef DEBUGDNS
@@ -340,11 +410,55 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                         inet_ntop(AF_INET, &dnsServer.targetDnsIPv4.sin_addr, str, INET_ADDRSTRLEN);
                         char str2[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET, &si_other4.sin_addr, str2, INET_ADDRSTRLEN);
-                        std::cerr << str << "!=" << str2 << std::endl;
+                        std::cerr << str << "!=" << str2 << " for " << transactionId << " " << std::to_string(q.retryTime) << "%" << dnsServerList.size() << std::endl;
+                        std::cerr << "dnsServerList index: [";
+                        unsigned int index=0;
+                        while(index<dnsServerList.size())
+                        {
+                            if(index!=0)
+                                std::cerr << ",";
+                            std::cerr << std::to_string(preferedServerOrder[index]);
+                            index++;
+                        }
+                        std::cerr << "] and [";
+                        index=0;
+                        while(index<dnsServerList.size())
+                        {
+                            if(index!=0)
+                                std::cerr << ",";
+                            std::cerr << std::to_string(q.serverOrder[index]);
+                            index++;
+                        }
+                        std::cerr << "]";
+                        std::cerr << std::endl;
                         #endif
                         return;
                     }
+                    #else
+                    unsigned int index=0;
+                    while(index<dnsServerList.size())
+                    {
+                        const DnsServerEntry &dnsServer=dnsServerList.at(index);
+                        if(dnsServer.mode==Mode_IPv4 && memcmp(&dnsServer.targetDnsIPv4.sin_addr,&si_other4.sin_addr,4)==0)
+                            break;
+                        index++;
+                    }
+                    if(index>=dnsServerList.size())
+                    {
+                        #ifdef DEBUGDNS
+                        char str2[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &si_other4.sin_addr, str2, INET_ADDRSTRLEN);
+                        std::cerr << str2 << " unknow source for " << transactionId << " " << std::to_string(q.retryTime) << "%" << dnsServerList.size() << std::endl;
+                        #endif
+                        return;
+                    }
+                    #endif
                 }
+                if(httpInProgress>0)
+                    httpInProgress--;
+                #ifdef DEBUGDNS
+                checkCorruption();
+                #endif
 
                 #ifdef DEBUGDNS
                 std::cerr << __FILE__ << ":" << __LINE__ << " dns reply for " << q.host << std::endl;
@@ -399,6 +513,9 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                             std::cerr << __FILE__ << ":" << __LINE__ << " remove query due to  wrong string to resolve, host is not dns valid: " << transactionId << std::endl;
                             #endif
                             removeQuery(transactionId);
+                            #ifdef DEBUGDNS
+                            checkCorruption();
+                            #endif
                         }
                     }
                     else if((flags & 0xFA0F)!=0x8000)
@@ -444,6 +561,9 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                             std::cerr << __FILE__ << ":" << __LINE__ << " remove query due to (flags & 0xFA0F)!=0x8000: " << transactionId << std::endl;
                             #endif
                             removeQuery(transactionId);
+                            #ifdef DEBUGDNS
+                            checkCorruption();
+                            #endif
                         }
                     }
                     else
@@ -501,6 +621,9 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                     std::cerr << __FILE__ << ":" << __LINE__ << " remove query due to failed read type: " << transactionId << std::endl;
                                     #endif
                                     removeQuery(transactionId);
+                                    #ifdef DEBUGDNS
+                                    checkCorruption();
+                                    #endif
                                 }
                             switch(type)
                             {
@@ -561,6 +684,9 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                             std::cerr << __FILE__ << ":" << __LINE__ << " wrong ip, dns done: " << transactionId << std::endl;
                                             #endif
                                             removeQuery(transactionId);
+                                            #ifdef DEBUGDNS
+                                            checkCorruption();
+                                            #endif
                                         }
                                     }
                                     else
@@ -586,6 +712,9 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                             std::cerr << __FILE__ << ":" << __LINE__ << " right ip, dns done: " << transactionId << std::endl;
                                             #endif
                                             removeQuery(transactionId);
+                                            #ifdef DEBUGDNS
+                                            checkCorruption();
+                                            #endif
                                         }
                                     }
                                 }
@@ -610,6 +739,9 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                             }
                             answersIndex++;
                         }
+                        #ifdef DEBUGDNS
+                        checkCorruption();
+                        #endif
                         if(!clientsFlushed)
                         {
                             clientsFlushed=true;
@@ -651,12 +783,21 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                             std::cerr << __FILE__ << ":" << __LINE__ << " if(!clientsFlushed): " << transactionId << std::endl;
                             #endif
                             removeQuery(transactionId);
+                            #ifdef DEBUGDNS
+                            checkCorruption();
+                            #endif
                         }
+                        #ifdef DEBUGDNS
+                        checkCorruption();
+                        #endif
                     }
                 }
             }
         } while(size>=0);
     }
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
 }
 
 void Dns::cleanCache()
@@ -721,21 +862,39 @@ void Dns::addCacheEntry(const StatusEntry &s,const uint32_t &ttl,const std::stri
     // normal case: check time minimum each 5min, maximum 24h
     if(s==StatusEntry_Right)
     {
+        #ifdef LOWTIMEDNSCACHE
+        if(ttl<5)
+            entry.outdated_date=time(NULL)+5/CACHETIMEDIVIDER;
+        else if(ttl<10)
+            entry.outdated_date=time(NULL)+ttl/CACHETIMEDIVIDER;
+        else
+            entry.outdated_date=time(NULL)+10/CACHETIMEDIVIDER;
+        #else
         if(ttl<5*60)
             entry.outdated_date=time(NULL)+5*60/CACHETIMEDIVIDER;
         else if(ttl<24*3600)
             entry.outdated_date=time(NULL)+ttl/CACHETIMEDIVIDER;
         else
             entry.outdated_date=time(NULL)+24*3600/CACHETIMEDIVIDER;
+        #endif
     }
     else // error case: check time minimum each 10s, maximum 10min
     {
+        #ifdef LOWTIMEDNSCACHE
+        if(ttl<5)
+            entry.outdated_date=time(NULL)+5/CACHETIMEDIVIDER;
+        else if(ttl<10)
+            entry.outdated_date=time(NULL)+ttl/CACHETIMEDIVIDER;
+        else
+            entry.outdated_date=time(NULL)+10/CACHETIMEDIVIDER;
+        #else
         if(ttl<10)
             entry.outdated_date=time(NULL)+10/CACHETIMEDIVIDER;
         else if(ttl<600)
             entry.outdated_date=time(NULL)+ttl/CACHETIMEDIVIDER;
         else
             entry.outdated_date=time(NULL)+600/CACHETIMEDIVIDER;
+        #endif
     }
     #ifdef DEBUGDNS
     std::cerr << __FILE__ << ":" << __LINE__ << " insert into cache " << host << " " << (int64_t)entry.outdated_date << std::endl;
@@ -808,6 +967,9 @@ bool Dns::read32Bits(uint32_t &var, const char * const data, const int &size, in
 
 bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
 {
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
     if(dnsServerList.empty())
     {
         std::cerr << "Sorry but the server list is empty" << std::endl;
@@ -819,7 +981,7 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
         abort();
     }
     #ifdef DEBUGDNS
-    std::cerr << __FILE__ << ":" << __LINE__ << " try resolv " << host << " " << (int64_t)time(NULL) << std::endl;
+    std::cerr << __FILE__ << ":" << __LINE__ << " try resolv " << host << " " << (int64_t)time(NULL) << " https: " << https << " client: " << client << std::endl;
     if(host=="www.bolivia-online.com" || host=="bolivia-online.com")
     {
         std::cerr << __FILE__ << ":" << __LINE__ << std::endl;
@@ -834,35 +996,47 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
         const uint16_t &queryId=queryListByHost.at(host);
         if(queryList.find(queryId)!=queryList.cend())
         {
-            if(https)
+            Query &q=queryList[queryId];
+            if(q.host==host)
             {
-                queryList[queryId].https.push_back(client);
-                #ifdef DEBUGDNS
+                if(https)
                 {
-                    const Query &q=queryList[queryId];
+                    q.https.push_back(client);
+                    #ifdef DEBUGDNS
                     std::cerr << __FILE__ << ":" << __LINE__ << " try resolv " << host << " add " << client << " to query " << queryId << " (" << q.nextRetry << ") for https" << std::endl;
+                    #endif
                 }
-                #endif
+                else
+                {
+                    q.http.push_back(client);
+                    #ifdef DEBUGDNS
+                    std::cerr << __FILE__ << ":" << __LINE__ << " try resolv " << host << " add " << client << " to query " << queryId << " (" << q.nextRetry << ") for http" << std::endl;
+                    #endif
+                }
+                return true;
             }
             else
             {
-                queryList[queryId].http.push_back(client);
                 #ifdef DEBUGDNS
-                {
-                    const Query &q=queryList[queryId];
-                    std::cerr << __FILE__ << ":" << __LINE__ << " try resolv " << host << " add " << client << " to query " << queryId << " (" << q.nextRetry << ") for http" << std::endl;
-                }
+                std::cerr << __FILE__ << ":" << __LINE__ << " corrupted index: queryListByHost.find(): " << host << " queryId: " << queryId << " Query: " << q.host << " " << q.nextRetry << " " << q.retryTime << std::endl;
                 #endif
+                queryListByHost.erase(host);
             }
-            return true;
         }
         else //bug, try fix
+        {
+            #ifdef DEBUGDNS
+            std::cerr << __FILE__ << ":" << __LINE__ << " found: " << host << " but " << queryId <<  " not found, warning" << std::endl;
+            #endif
             queryListByHost.erase(host);
+        }
     }
     #ifdef DEBUGDNS
-    std::cerr << __FILE__ << ":" << __LINE__ << std::endl;
+    checkCorruption();
     #endif
-    //#ifndef DEBUGDNS
+    #ifdef DEBUGDNS
+    std::cerr << __FILE__ << ":" << __LINE__ << " is not into pending query, then search in cache" << std::endl;
+    #endif
     if(cacheAAAA.find(host)!=cacheAAAA.cend())
     {
         CacheAAAAEntry &entry=cacheAAAA.at(host);
@@ -932,9 +1106,11 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
             std::cerr << __FILE__ << ":" << __LINE__ << " try resolv " << host << " entry.outdated_date<=t: " << entry.outdated_date << ">" << (int64_t)time(NULL) << std::endl;
         #endif
     }
-    //#endif
     #ifdef DEBUGDNS
-    std::cerr << __FILE__ << ":" << __LINE__ << std::endl;
+    checkCorruption();
+    #endif
+    #ifdef DEBUGDNS
+    std::cerr << __FILE__ << ":" << __LINE__ << " is not in cache, send new query" << std::endl;
     #endif
     if(httpInProgress>1000)
     {
@@ -943,7 +1119,6 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
         #endif
         return false;
     }
-    httpInProgress++;
     /* TODO if(isInCache())
     {load from cache}*/
     //std::cout << "dns query count merged in progress>1000" << std::endl;
@@ -1005,7 +1180,7 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
     #else
     queryToPush.retryTime=0;
     #endif
-    queryToPush.nextRetry=time(NULL)+5;
+    queryToPush.nextRetry=time(NULL)+queryDNSTimeout();
     queryToPush.query=std::string((char *)buffer,pos);
     #ifdef DEBUGDNS
     if(sizeof(preferedServerOrder)!=sizeof(queryToPush.serverOrder))
@@ -1016,7 +1191,12 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
     #endif
     memcpy(queryToPush.serverOrder,preferedServerOrder,sizeof(preferedServerOrder));
 
-    const DnsServerEntry &dnsServer=dnsServerList.at(queryToPush.serverOrder[0]);
+    if(queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]>=dnsServerList.size())
+    {
+        std::cerr << __FILE__ << ":" << __LINE__ << " " << std::to_string(queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]) << ">=" << dnsServerList.size() << " (abort)" << std::endl;
+        abort();
+    }
+    const DnsServerEntry &dnsServer=dnsServerList.at(queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]);
     if(dnsServer.mode==Mode_IPv6)
     {
         const int result = sendto(IPv6Socket->getFD(),&buffer,pos,0,(struct sockaddr*)&dnsServer.targetDnsIPv6,sizeof(dnsServer.targetDnsIPv6));
@@ -1025,7 +1205,15 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
             #ifdef DEBUGDNS
             char str[INET6_ADDRSTRLEN];
             inet_ntop(AF_INET6, &dnsServer.targetDnsIPv6.sin6_addr, str, INET6_ADDRSTRLEN);
-            std::cerr << "sendto Mode_IPv6 failed: " << str << " to resolv: " << host << std::endl;
+            std::cerr << "sendto Mode_IPv6 failed: " << str << " to resolv: " << host << " queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]: " << std::to_string(queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]) << " queryToPush.retryTime: " << std::to_string(queryToPush.retryTime) << std::endl;
+            #endif
+        }
+        else
+        {
+            #ifdef DEBUGDNS
+            char str[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &dnsServer.targetDnsIPv6.sin6_addr, str, INET6_ADDRSTRLEN);
+            std::cerr << "sendto Mode_IPv6 ok: " << str << " to resolv: " << host << " queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]: " << std::to_string(queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]) << " queryToPush.retryTime: " << std::to_string(queryToPush.retryTime) << std::endl;
             #endif
         }
     }
@@ -1037,7 +1225,15 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
             #ifdef DEBUGDNS
             char str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &dnsServer.targetDnsIPv4.sin_addr, str, INET_ADDRSTRLEN);
-            std::cerr << "sendto Mode_IPv4 failed: " << str << " to resolv: " << host << std::endl;
+            std::cerr << "sendto Mode_IPv4 failed: " << str << " to resolv: " << host << " queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]: " << std::to_string(queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]) << " queryToPush.retryTime: " << std::to_string(queryToPush.retryTime) << std::endl;
+            #endif
+        }
+        else
+        {
+            #ifdef DEBUGDNS
+            char str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &dnsServer.targetDnsIPv4.sin_addr, str, INET_ADDRSTRLEN);
+            std::cerr << "sendto Mode_IPv4 ok: " << str << " to resolv: " << host << " queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]: " << std::to_string(queryToPush.serverOrder[queryToPush.retryTime%dnsServerList.size()]) << " queryToPush.retryTime: " << std::to_string(queryToPush.retryTime) << std::endl;
             #endif
         }
     }
@@ -1047,7 +1243,10 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
     else
         queryToPush.http.push_back(client);
     #ifdef DEBUGDNS
-    std::cerr << __FILE__ << ":" << __LINE__ << " dns query send " << query->id << std::endl;
+    std::cerr << __FILE__ << ":" << __LINE__ << " dns query send " << std::to_string(query->id) << " client: " << client << std::endl;
+    #endif
+    #ifdef DEBUGDNS
+    checkCorruption();
     #endif
     addQuery(query->id,queryToPush);
     return true;
@@ -1055,22 +1254,44 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
 
 void Dns::addQuery(const uint16_t &id, const Query &query)
 {
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
+    #ifdef DEBUGDNS
+    std::cerr << __FILE__ << ":" << __LINE__ << " dns query send Dns::addQuery(): " << std::to_string(id) << " query.nextRetry: " << query.nextRetry << " current time: " << Backend::msFrom1970() << std::endl;
+    #endif
     queryList[id]=query;
     queryListByHost[query.host]=id;
     queryByNextDueTime[query.nextRetry].push_back(id);
+    if(httpInProgress<2000000000)
+        httpInProgress++;
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
 }
 
 void Dns::removeQuery(const uint16_t &id, const bool &withNextDueTime)
 {
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
     const Query &query=queryList.at(id);
     if(withNextDueTime)
         queryByNextDueTime.erase(query.nextRetry);
     queryListByHost.erase(query.host);
     queryList.erase(id);
+    if(httpInProgress>0)
+        httpInProgress--;
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
 }
 
 void Dns::cancelClient(Http * client, const std::string &host,const bool &https)
 {
+    #ifdef DEBUGDNS
+    std::cerr << __FILE__ << ":" << __LINE__ << " cancelClient(" << client << "," << host << "," << https << ")" << std::endl;
+    #endif
     if(queryListByHost.find(host)!=queryListByHost.cend())
     {
         const uint16_t queryId=queryListByHost.at(host);
@@ -1120,9 +1341,12 @@ void Dns::cancelClient(Http * client, const std::string &host,const bool &https)
     else
     {
         #ifdef DEBUGDNS
-        std::cerr << __FILE__ << ":" << __LINE__ << " try remove: \"" << host << "\" but not found WARNING (queryListByHost.find(host)!=queryListByHost.cend()" << std::endl;
+        std::cerr << __FILE__ << ":" << __LINE__ << " try remove: \"" << host << "\" but not found WARNING (queryListByHost.find(host)!=queryListByHost.cend(), client: " << client << std::endl;
         #endif
     }
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
 }
 
 int Dns::requestCountMerged()
@@ -1148,6 +1372,38 @@ std::string Dns::getQueryList() const
         }
         ret+=retT+")";
     }
+    ret+=" [";
+    unsigned int index=0;
+    while(index<dnsServerList.size())
+    {
+        if(index!=0)
+            ret+=",";
+        if(index<sizeof(preferedServerOrder))
+        {
+            if(preferedServerOrder[index]<dnsServerList.size())
+            {
+                const DnsServerEntry &d=dnsServerList.at(preferedServerOrder[index]);
+                if(d.mode==Mode_IPv6)
+                {
+                    char str[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, &d.targetDnsIPv6.sin6_addr, str, INET6_ADDRSTRLEN);
+                    ret+=str;
+                }
+                else
+                {
+                    char str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &d.targetDnsIPv4.sin_addr, str, INET_ADDRSTRLEN);
+                    ret+=str;
+                }
+            }
+            else
+                ret+="preferedServerOrder["+std::to_string(index)+"]:"+std::to_string(preferedServerOrder[index])+">="+std::to_string(dnsServerList.size());
+        }
+        else
+            ret+="preferedServerOrder: "+std::to_string(index)+">="+std::to_string(sizeof(preferedServerOrder));
+        index++;
+    }
+    ret+="]";
     return ret;
 }
 
@@ -1159,8 +1415,30 @@ int Dns::get_httpInProgress() const
         return 0;
 }
 
+uint8_t Dns::serverCount() const
+{
+    return dnsServerList.size();
+}
+
+uint8_t Dns::retryBeforeError() const
+{
+    return 2;
+}
+
+uint8_t Dns::queryDNSTimeout() const
+{
+    #ifdef LOWTIMEDNSCACHE
+    return 1;
+    #else
+    return 5;
+    #endif
+}
+
 void Dns::checkQueries()
 {
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
     const std::map<uint64_t,std::vector<uint16_t>> queryByNextDueTime=this->queryByNextDueTime;
     for (auto const &x : queryByNextDueTime)
     {
@@ -1171,10 +1449,15 @@ void Dns::checkQueries()
         for (auto const& id : list)
         {
             Query &query=queryList.at(id);
-            if(query.retryTime<dnsServerList.size()*2)
+            if(query.retryTime<dnsServerList.size()*Dns::retryBeforeError())
             {
                 {
                     const uint8_t &currentQueryIndex=query.retryTime%dnsServerList.size();
+                    if(currentQueryIndex>=sizeof(query.serverOrder))
+                    {
+                        std::cerr << __FILE__ << ":" << __LINE__ << " " << std::to_string(currentQueryIndex) << ">=" << sizeof(query.serverOrder) << " (abort)" << std::endl;
+                        abort();
+                    }
                     const uint8_t &currentServerIndex=query.serverOrder[currentQueryIndex];
                     if(lastDnsFailed!=currentServerIndex)
                     {
@@ -1197,7 +1480,13 @@ void Dns::checkQueries()
                         index=0;
                         while(index<dnsServerList.size())
                         {
-                            preferedServerOrder[index]=tempList[index].first;
+                            if(index<sizeof(preferedServerOrder))
+                                preferedServerOrder[index]=tempList[index].first;
+                            else
+                            {
+                                std::cerr << __FILE__ << ":" << __LINE__ << " " << std::to_string(index) << ">=" << sizeof(preferedServerOrder) << " (abort)" << std::endl;
+                                abort();
+                            }
                             index++;
                         }
                     }
@@ -1206,7 +1495,17 @@ void Dns::checkQueries()
                 query.retryTime++;
 
                 const uint8_t &currentQueryIndex=query.retryTime%dnsServerList.size();
+                if(currentQueryIndex>=sizeof(query.serverOrder))
+                {
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << std::to_string(currentQueryIndex) << ">=" << sizeof(query.serverOrder) << " (abort)" << std::endl;
+                    abort();
+                }
                 const uint8_t &currentServerIndex=query.serverOrder[currentQueryIndex];
+                if(currentServerIndex>=dnsServerList.size())
+                {
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << std::to_string(currentServerIndex) << ">=" << dnsServerList.size() << " (abort)" << std::endl;
+                    abort();
+                }
                 const DnsServerEntry &dnsServer=dnsServerList.at(currentServerIndex);
                 if(dnsServer.mode==Mode_IPv6)
                 {
@@ -1216,7 +1515,7 @@ void Dns::checkQueries()
                         #ifdef DEBUGDNS
                         char str[INET6_ADDRSTRLEN];
                         inet_ntop(AF_INET6, &dnsServer.targetDnsIPv6.sin6_addr, str, INET6_ADDRSTRLEN);
-                        std::cerr << "sendto Mode_IPv6 reemit failed: " << str << " to resolv: " << query.host << std::endl;
+                        std::cerr << "sendto Mode_IPv6 reemit failed: " << str << " to resolv: " << query.host << " result: " << result << " errno: " << errno << std::endl;
                         #endif
                     }
                     else
@@ -1236,7 +1535,7 @@ void Dns::checkQueries()
                         #ifdef DEBUGDNS
                         char str[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET, &dnsServer.targetDnsIPv4.sin_addr, str, INET_ADDRSTRLEN);
-                        std::cerr << "sendto Mode_IPv4 reemit failed: " << str << " to resolv: " << query.host << std::endl;
+                        std::cerr << "sendto Mode_IPv4 reemit failed: " << str << " to resolv: " << query.host << " result: " << result << " errno: " << errno << std::endl;
                         #endif
                     }
                     else
@@ -1252,7 +1551,7 @@ void Dns::checkQueries()
                 std::cerr << "sendto reemit" << std::endl;
                 #endif
 
-                query.nextRetry=time(NULL)+5;
+                query.nextRetry=time(NULL)+queryDNSTimeout();
                 this->queryByNextDueTime[query.nextRetry].push_back(id);
             }
             else
@@ -1305,4 +1604,31 @@ void Dns::checkQueries()
         this->queryByNextDueTime.erase(t);
         //cacheByOutdatedDate.erase(t);
     }
+    #ifdef DEBUGDNS
+    checkCorruption();
+    #endif
 }
+
+#ifdef DEBUGDNS
+void Dns::checkCorruption()
+{
+    for( const auto& n : queryListByHost ) {
+        const std::string &host=n.first;
+        const uint16_t &queryId=n.second;
+        if(queryList.find(queryId)!=queryList.cend())
+        {
+            const Query &q=queryList[queryId];
+            if(q.host!=host)
+            {
+                std::cerr << __FILE__ << ":" << __LINE__ << " found: " << host << ", " << queryId <<  " found, but query value: " << q.host << " (abort)" << std::endl;
+                abort();
+            }
+        }
+        else
+        {
+            std::cerr << __FILE__ << ":" << __LINE__ << " found: " << host << " but " << queryId <<  " not found (abort)" << std::endl;
+            abort();
+        }
+    }
+}
+#endif
