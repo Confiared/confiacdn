@@ -24,6 +24,7 @@ public:
     #ifdef DEBUGFASTCGI
     static std::unordered_set<Https *> toDebug;
     #endif
+    bool isHttps() override;
 public:
     //index can be: 29E7336BDEA3327B or XXXXXXXX/XXXXXXXXXXXXXXXXY
     static std::unordered_map<std::string,Http *> pathToHttps;

@@ -141,11 +141,14 @@ Http::~Http()
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
-        Dns::dns->cancelClient(this,host,&pathToHttp!=&pathToHttpList());
+        Dns::dns->cancelClient(this,host,isHttps());
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
         status=Status_Idle;
+        #ifdef DEBUGFASTCGI
+        Http::checkIngrityHttpClient();
+        #endif
     }
 
     delete tempCache;
@@ -214,7 +217,6 @@ bool Http::tryConnect(const std::string &host, const std::string &uri, const boo
         std::cerr << "Http::tryConnect() status!=Status_Idle " << __FILE__ << ":" << __LINE__ << std::endl;
         abort();
     }
-    status=Status_WaitDns;
     #ifdef DEBUGFASTCGI
     const auto p1 = std::chrono::system_clock::now();
     std::cerr << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << " try connect " << this << " uri: " << uri << ": " << __FILE__ << ":" << __LINE__ << std::endl;
@@ -226,7 +228,11 @@ bool Http::tryConnect(const std::string &host, const std::string &uri, const boo
     this->uri=uri;
     this->etagBackend=etag;
 
-    if(!Dns::dns->getAAAA(this,host,&pathToHttp!=&pathToHttpList()))
+    #ifdef DEBUGFASTCGI
+    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " status=Status_WaitDns" << std::endl;
+    #endif
+    status=Status_WaitDns;
+    if(!Dns::dns->getAAAA(this,host,isHttps()))
     {
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN dns overloaded" << std::endl;
@@ -234,8 +240,14 @@ bool Http::tryConnect(const std::string &host, const std::string &uri, const boo
         parseNonHttpError(Backend::NonHttpError_DnsOverloaded);
         disconnectFrontend(true);
         disconnectBackend();
+        #ifdef DEBUGFASTCGI
+        Http::checkIngrityHttpClient();
+        #endif
         return false;
     }
+    #ifdef DEBUGFASTCGI
+    Http::checkIngrityHttpClient();
+    #endif
     return true;
 }
 
@@ -243,38 +255,68 @@ void Http::dnsError()
 {
     if(status!=Status_WaitDns)
     {
-        /*std::cerr << "Http::dnsRight() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
+        /*std::cerr << "Http::dnsError() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
         abort();*/
         //now it's just a warning
-        std::cerr << "Http::dnsRight() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
+        std::cerr << "Http::dnsError() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
         return;
     }
     status=Status_WaitTheContent;
     #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
+    #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
     #endif
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
     parseNonHttpError(Backend::NonHttpError_DnsError);
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
     disconnectFrontend(true);
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
     disconnectBackend();
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
 }
 
 void Http::dnsWrong()
 {
     if(status!=Status_WaitDns)
     {
-        /*std::cerr << "Http::dnsRight() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
+        /*std::cerr << "Http::dnsWrong() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
         abort();*/
         //now it's just a warning
-        std::cerr << "Http::dnsRight() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
+        std::cerr << "Http::dnsWrong() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
         return;
     }
     status=Status_WaitTheContent;
     #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
+    #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
     #endif
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
     parseNonHttpError(Backend::NonHttpError_DnsWrong);
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
     disconnectFrontend(true);
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
     disconnectBackend();
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
 }
 
 void Http::dnsRight(const sockaddr_in6 &sIPv6)
@@ -287,17 +329,39 @@ void Http::dnsRight(const sockaddr_in6 &sIPv6)
         std::cerr << "Http::dnsRight() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
         return;
     }
+    status=Status_WaitTheContent;
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
     lastReceivedBytesTimestamps=Backend::msFrom1970();
     #ifdef DEBUGFASTCGI
     char str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &sIPv6.sin6_addr, str, INET6_ADDRSTRLEN);
+    #ifdef DEBUGDNS
+    if(Dns::dns->hardcodedDns.find(host)!=Dns::dns->hardcodedDns.cend())
+        if(std::string(str)!=Dns::dns->hardcodedDns.at(host))
+        {
+            std::cerr << host << ": " << str << " corruption detected by hard coded value (abort) " << __FILE__ << ":" << __LINE__ << std::endl;
+            abort();
+        }
+    #endif
     std::cerr << this << ": Http::dnsRight() " << host << ": " << str << " url: " << getUrl() << " " << __FILE__ << ":" << __LINE__ << std::endl;
     #endif
-    status=Status_WaitTheContent;
     #ifdef DEBUGFASTCGI
     m_socket=sIPv6;
     #endif
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
     tryConnectInternal(sIPv6);
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
+}
+
+bool Http::isHttps()
+{
+    return false;
 }
 
 bool Http::tryConnectInternal(const sockaddr_in6 &s)
@@ -310,7 +374,7 @@ bool Http::tryConnectInternal(const sockaddr_in6 &s)
     bool connectInternal=false;
     #ifdef DEBUGFASTCGI
     char str[INET6_ADDRSTRLEN];
-    inet_ntop(AF_INET6, &s, str, INET6_ADDRSTRLEN);
+    inet_ntop(AF_INET6, &s.sin6_addr, str, INET6_ADDRSTRLEN);
     std::cerr << this << ": Http::tryConnectInternal " << host << ": " << str << " url: " << getUrl() << " " << __FILE__ << ":" << __LINE__ << std::endl;
     #endif
     backend=Backend::tryConnectHttp(s,this,connectInternal,&backendList);
@@ -424,7 +488,7 @@ bool Http::get_requestSended()
     return requestSended;
 }
 
-bool Http::get_status()
+Http::Status Http::get_status() const
 {
     return status;
 }
@@ -1280,6 +1344,16 @@ void Http::checkIngrityHttpClient()
         {
             if(client->http!=nullptr)
             {
+                #ifdef DEBUGDNS
+                if(client->http->get_status()==Status_WaitDns)
+                {
+                    if(!Dns::dns->queryHaveThisClient(client->http,client->http->host,client->http->isHttps()))
+                    {
+                        std::cerr << "Http::checkIngrityHttpClient() " << client->http << " getStatus(): Status_WaitDns but not query have this client " << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                        abort();
+                    }
+                }
+                #endif
                 bool found=false;
                 for(Client * search : client->http->clientsList)
                 {
@@ -1297,6 +1371,7 @@ void Http::checkIngrityHttpClient()
             }
         }
     }
+    Dns::dns->checkCorruption();
     for(const Http * http : Http::toDebug)
     {
         if(http!=nullptr)
@@ -2081,11 +2156,14 @@ void Http::disconnectBackend(const bool fromDestructor)
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
-        Dns::dns->cancelClient(this,host,&pathToHttp!=&pathToHttpList());
+        Dns::dns->cancelClient(this,host,isHttps());
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
         status=Status_Idle;
+        #ifdef DEBUGFASTCGI
+        Http::checkIngrityHttpClient();
+        #endif
     }
     host.clear();
     uri.clear();
@@ -2816,7 +2894,7 @@ bool Http::detectTimeout()
     unsigned int secondForTimeout=5;
     if(status==Status_WaitDns)
         //timeout * server count * try
-        secondForTimeout=Dns::dns->queryDNSTimeout()*Dns::dns->serverCount()*Dns::dns->retryBeforeError();
+        secondForTimeout=Dns::dns->resendQueryDNS_ms()*Dns::dns->retryBeforeError();
     else if(pending)
     {
         if(requestSended)

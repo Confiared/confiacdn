@@ -61,3 +61,8 @@ std::string Https::getUrl() const
     else
         return "https://"+host+uri;
 }
+
+bool Https::isHttps()
+{
+    return true;
+}

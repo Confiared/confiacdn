@@ -760,7 +760,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
         reply+="\r\n";
         reply+="Dns ("+std::to_string(Dns::dns->get_httpInProgress())+"): ";
         reply+=Dns::dns->getQueryList();
-        reply+="\r\n";
+        //reply+="\r\n";
         size_t isNotValideCount=0;
         for( const auto &n : Client::clients )
             if(!n->isValid())

@@ -46,7 +46,7 @@ public:
     const std::string &getCachePath() const;
     void resetRequestSended();
     bool get_requestSended();
-    bool get_status();
+    Status get_status() const;
     bool haveUrlAndFrontendConnected() const;
     bool isAlive() const;
     bool isWithClient() const;
@@ -71,6 +71,7 @@ public:
     void dnsRight(const sockaddr_in6 &sIPv6);
     void dnsError();
     void dnsWrong();
+    virtual bool isHttps();
 public:
     //index can be: 29E7336BDEA3327B or XXXXXXXX/XXXXXXXXXXXXXXXXY
     static std::unordered_map<std::string,Http *> pathToHttp;

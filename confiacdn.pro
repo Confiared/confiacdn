@@ -23,6 +23,7 @@ DEFINES += DEBUGDNS
 #DEFINES += DEBUGFILEOPEN
 DEFINES += DEBUGFASTCGITCP
 DEFINES += ONFLYENCODEFASTCGI
+DEFINES += LOWTIMEDNSCACHE
 }
 
 #DEFINES += HOSTSUBFOLDER
@@ -30,6 +31,7 @@ DEFINES += ONFLYENCODEFASTCGI
 SOURCES += main.cpp \
     Client.cpp \
     Common.cpp \
+    DnsSocket.cpp \
     EpollObject.cpp \
     Server.cpp \
     ServerTCP.cpp \
@@ -44,6 +46,7 @@ SOURCES += main.cpp \
 HEADERS += \
     Client.hpp \
     Common.hpp \
+    DnsSocket.hpp \
     EpollObject.hpp \
     Server.hpp \
     ServerTCP.hpp \

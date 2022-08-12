@@ -12,7 +12,6 @@
 #define CACHETIMEDIVIDER 1
 //should be power of 2
 #define MAXDNSSERVER 16
-//#define PARALLELQUERIES
 
 class Http;
 class DnsSocket;
@@ -31,17 +30,23 @@ public:
     bool tryOpenSocket();
     bool getAAAA(Http * http,const std::string &host,const bool &https);
     void cancelClient(Http * http,const std::string &host,const bool &https);
+    #ifdef DEBUGDNS
+    //very heavy check
+    bool queryHaveThisClient(Http * http,const std::string &host,const bool &https) const;
+    #endif
     int requestCountMerged();
     void cleanCache();
     void checkQueries();
     uint8_t serverCount() const;
     uint8_t retryBeforeError() const;
-    uint8_t queryDNSTimeout() const;
+    uint8_t resendQueryDNS_ms() const;
     static Dns *dns;
     std::string getQueryList() const;
     int get_httpInProgress() const;
     #ifdef DEBUGDNS
-    void checkCorruption();
+    static void checkCorruption();
+    static void checkCorruptionCache();
+    static std::unordered_map<std::string,std::string> hardcodedDns;
     #endif
     static const unsigned char include[];
     static const unsigned char exclude[];
@@ -75,20 +80,19 @@ private:
         uint64_t lastFailed;//0 if never failed
     };
     std::vector<DnsServerEntry> dnsServerList;
-    uint8_t lastDnsFailed;//255 if no server dns failed
     //to put on last try the dns server with problem
     uint8_t preferedServerOrder[MAXDNSSERVER];//if MAXDNSSERVER <=16 then lower memory on 64Bits system than std::vector (std::vector memory = 16bytes + X entry 1Byte/8Bits)
     uint16_t increment;
 
     struct Query {
+        uint64_t startTimeInms;
         std::string host;
         //separate http and https to improve performance by better caching socket to open
         std::vector<Http *> http;
         std::vector<Http *> https;
-        uint8_t retryTime;
+        uint8_t retryTime;//number of time all query was send, now all query is send at time
         uint64_t nextRetry;
         std::string query;
-        uint8_t serverOrder[MAXDNSSERVER];//if MAXDNSSERVER <=16 then lower memory on 64Bits system than std::vector (std::vector memory = 16bytes + X entry 1Byte/8Bits)
     };
     int httpInProgress;
     void addQuery(const uint16_t &id,const Query &query);

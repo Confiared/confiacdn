@@ -143,7 +143,7 @@ int main(int argc, char *argv[])
     DNSCache dnsCache;
     dnsCache.start(3600*1000);
     DNSQuery dnsQuery;
-    dnsQuery.start(10);
+    dnsQuery.start(50);
     CheckTimeout checkTimeout;
     checkTimeout.start(1000);
     CleanOldCache cleanOldCache;
@@ -176,6 +176,38 @@ int main(int argc, char *argv[])
         memcpy(Http::fastcgiheaderstdout+1+1+2,&sizebe,2);
         memcpy(Http::fastcgiheaderstdout+1+1+2+2,&padding,2);
     }
+
+    #ifdef DEBUGDNS
+    {
+        FILE *stream;
+        char *line = NULL;
+        size_t len = 0;
+        ssize_t nread;
+
+        stream = fopen("dns.txt", "r");
+        if (stream != NULL)
+        {
+            while ((nread = getline(&line, &len, stream)) != -1) {
+                std::string str(line);
+                std::size_t pos=str.find(" ");
+                if (pos!=std::string::npos)
+                {
+                    std::string host=str.substr(0,pos);
+                    std::string ipv6=str.substr(pos+1);
+                    if(!ipv6.empty())
+                    {
+                        if(ipv6.at(ipv6.size()-1)=='\n')
+                            ipv6=ipv6.substr(0,ipv6.size()-1);
+                        Dns::dns->hardcodedDns[host]=ipv6;
+                    }
+                }
+            }
+
+            free(line);
+            fclose(stream);
+        }
+    }
+    #endif
 
     /* cachePath (content header, 64Bits aligned):
      * 64Bits: access time
@@ -268,6 +300,12 @@ int main(int argc, char *argv[])
         newDeleteHttp.clear();
         for (int n = 0; n < nfds; ++n)
         {
+            #ifdef DEBUGFASTCGI
+            Http::checkIngrityHttpClient();
+            #endif
+            #ifdef DEBUGDNS
+            Dns::dns->checkCorruption();
+            #endif
             epoll_event &e=events[n];
             switch(static_cast<EpollObject *>(e.data.ptr)->getKind())
             {
@@ -328,6 +366,12 @@ int main(int argc, char *argv[])
                 default:
                 break;
             }
+            #ifdef DEBUGFASTCGI
+            Http::checkIngrityHttpClient();
+            #endif
+            #ifdef DEBUGDNS
+            Dns::dns->checkCorruption();
+            #endif
         }
         newDeleteClient.insert(Client::toDelete.begin(),Client::toDelete.end());
         Client::toDelete.clear();
