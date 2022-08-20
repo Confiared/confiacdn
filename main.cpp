@@ -290,8 +290,25 @@ int main(int argc, char *argv[])
             #ifdef DEBUGFASTCGI
             std::cerr << "delete http " << (void *)r << std::endl;
             #endif
+            if(r->get_status()==Http::Status::Status_WaitDns)
+            {
+                Dns::dns->cancelClient(r,r->get_host(),r->isHttps(),true);
+                #ifdef DEBUGDNS
+                Dns::checkCorruption();
+                #endif
+            }
+            r->disconnectBackend(true);
+            #ifdef DEBUGDNS
+            Dns::checkCorruption();
+            #endif
             delete r;
+            #ifdef DEBUGDNS
+            Dns::checkCorruption();
+            #endif
         }
+        #ifdef DEBUGDNS
+        Dns::checkCorruption();
+        #endif
         oldDeleteClient=newDeleteClient;
         newDeleteClient.clear();
         oldDeleteBackend=newDeleteBackend;

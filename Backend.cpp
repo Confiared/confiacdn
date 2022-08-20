@@ -36,7 +36,7 @@ Backend::Backend(BackendList * backendList) :
     http(nullptr),
     https(false),
     wasTCPConnected(false),
-    lastReceivedBytesmsTimestamps(0),
+    lastActivitymsTimestamps(0),
     backendList(backendList),
     ctx(nullptr),
     ssl(nullptr)
@@ -44,7 +44,7 @@ Backend::Backend(BackendList * backendList) :
     #ifdef DEBUGFASTCGI
     toDebug.insert(this);
     #endif
-    lastReceivedBytesmsTimestamps=Backend::msFrom1970();
+    lastActivitymsTimestamps=Backend::msFrom1970();
     this->kind=EpollObject::Kind::Kind_Backend;
 }
 
@@ -984,6 +984,7 @@ bool Backend::tryConnectInternal(const sockaddr_in6 &s)
     /* --------------------------------------------- */
     /* Create a normal socket and connect to server. */
 
+    lastActivitymsTimestamps=Backend::msFrom1970();
     fd = socket(AF_INET6, SOCK_STREAM, 0);
     if(fd==-1)
     {
@@ -1217,7 +1218,7 @@ ssize_t Backend::socketRead(void *buffer, size_t size)
         }
         else
         {
-            lastReceivedBytesmsTimestamps=Backend::msFrom1970();
+            lastActivitymsTimestamps=Backend::msFrom1970();
             return readen;
         }
     }
@@ -1228,13 +1229,14 @@ ssize_t Backend::socketRead(void *buffer, size_t size)
         std::cout << "Socket byte read: " << s << std::endl;
         #endif*/
         if(s>0)
-            lastReceivedBytesmsTimestamps=Backend::msFrom1970();
+            lastActivitymsTimestamps=Backend::msFrom1970();
         return s;
     }
 }
 
 bool Backend::socketWrite(const void *buffer, size_t size)
 {
+    lastActivitymsTimestamps=Backend::msFrom1970();
     #ifdef DEBUGFASTCGI
     std::cout << this << " " << "Try socket write: " << size << " " << __FILE__ << ":" << __LINE__ << std::endl;
     if(http==nullptr)
@@ -1341,15 +1343,15 @@ bool Backend::detectTimeout()
     if(http->get_status()==Http::Status_WaitDns)
         return false;
     const uint64_t var_msFrom1970=Backend::msFrom1970();
-    if(lastReceivedBytesmsTimestamps>(var_msFrom1970-5*1000))
+    if(lastActivitymsTimestamps>(var_msFrom1970-5*1000))
     {
         //prevent time drift
-        if(lastReceivedBytesmsTimestamps>var_msFrom1970)
+        if(lastActivitymsTimestamps>var_msFrom1970)
         {
             #ifdef DEBUGFASTCGI
-            std::cerr << this << " " << "lastReceivedBytesmsTimestamps>var_msFrom1970: " << lastReceivedBytesmsTimestamps << ">" << var_msFrom1970 << " time drift fixed WARNING" << std::endl;
+            std::cerr << this << " " << "lastReceivedBytesmsTimestamps>var_msFrom1970: " << lastActivitymsTimestamps << ">" << var_msFrom1970 << " time drift fixed WARNING" << std::endl;
             #endif
-            lastReceivedBytesmsTimestamps=var_msFrom1970;
+            lastActivitymsTimestamps=var_msFrom1970;
         }
         return false;
     }
@@ -1383,7 +1385,7 @@ std::string Backend::getQuery() const
         ret+="not alive";
     else
         ret+="alive on "+http->getUrl()+" "+std::to_string((uint64_t)http);
-    ret+=" last byte "+std::to_string(lastReceivedBytesmsTimestamps);
+    ret+=" last byte "+std::to_string(lastActivitymsTimestamps);
     if(wasTCPConnected)
         ret+=" wasTCPConnected";
     else

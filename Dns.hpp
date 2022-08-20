@@ -29,7 +29,7 @@ public:
     inline bool read32Bits(uint32_t &var, const char * const data, const int &size, int &pos);
     bool tryOpenSocket();
     bool getAAAA(Http * http,const std::string &host,const bool &https);
-    void cancelClient(Http * http,const std::string &host,const bool &https);
+    void cancelClient(Http * http,const std::string &host,const bool &https,const bool &ignoreNotFound=false);
     #ifdef DEBUGDNS
     //very heavy check
     bool queryHaveThisClient(Http * http,const std::string &host,const bool &https) const;

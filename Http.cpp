@@ -132,7 +132,7 @@ Http::~Http()
     }
     #endif
     #ifdef DEBUGFASTCGI
-    std::cerr << "Http::~Http(): destructor " << this << " uri: " << uri<< ": " << __FILE__ << ":" << __LINE__ << std::endl;
+    std::cerr << "Http::~Http(): destructor " << this << " uri: " << uri << " " << status << " " << __FILE__ << ":" << __LINE__ << std::endl;
     Backend *b=backend;
     #endif
 
@@ -141,7 +141,8 @@ Http::~Http()
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
-        Dns::dns->cancelClient(this,host,isHttps());
+        //Call to virtual method 'Http::isHttps' during destruction bypasses virtual dispatch [clang-analyzer-optin.cplusplus.VirtualCall]
+        //Dns::dns->cancelClient(this,host,isHttps(),true);-> done over destructor
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
@@ -1335,6 +1336,11 @@ std::unordered_map<std::string,Http *> &Http::pathToHttpList()
     return Http::pathToHttp;
 }
 
+std::string Http::get_host() const
+{
+    return host;
+}
+
 #ifdef DEBUGFASTCGI
 void Http::checkIngrityHttpClient()
 {
@@ -2156,7 +2162,7 @@ void Http::disconnectBackend(const bool fromDestructor)
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif
-        Dns::dns->cancelClient(this,host,isHttps());
+        Dns::dns->cancelClient(this,host,isHttps(),true);
         #ifdef DEBUGFASTCGI
         std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
         #endif

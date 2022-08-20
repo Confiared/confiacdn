@@ -1399,7 +1399,7 @@ void Dns::removeQuery(const uint16_t &id, const bool &withNextDueTime)
     #endif
 }
 
-void Dns::cancelClient(Http * client, const std::string &host,const bool &https)
+void Dns::cancelClient(Http * client, const std::string &host, const bool &https, const bool &ignoreNotFound)
 {
     #ifdef DEBUGDNS
     std::cerr << __FILE__ << ":" << __LINE__ << " cancelClient(" << client << "," << host << "," << https << ")" << std::endl;
@@ -1424,7 +1424,11 @@ void Dns::cancelClient(Http * client, const std::string &host,const bool &https)
                 }
                 #ifdef DEBUGDNS
                 if(index>=httpsList.size())
+                {
                     std::cerr << __FILE__ << ":" << __LINE__ << " try remove: " << client << " to \"" << host << "\" but not found WARNING https" << std::endl;
+                    if(!ignoreNotFound)
+                        abort();
+                }
                 #endif
             }
             else
@@ -1442,7 +1446,11 @@ void Dns::cancelClient(Http * client, const std::string &host,const bool &https)
                 }
                 #ifdef DEBUGDNS
                 if(index>=httpList.size())
+                {
                     std::cerr << __FILE__ << ":" << __LINE__ << " try remove: " << client << " to \"" << host << "\" but not found WARNING http" << std::endl;
+                    if(!ignoreNotFound)
+                        abort();
+                }
                 #endif
             }
             return;
@@ -1461,6 +1469,8 @@ void Dns::cancelClient(Http * client, const std::string &host,const bool &https)
         #ifdef DEBUGDNS
         std::cerr << __FILE__ << ":" << __LINE__ << " try remove: \"" << host << "\" but not found WARNING (queryListByHost.find(host)!=queryListByHost.cend(), client: " << client << std::endl;
         #endif
+        if(!ignoreNotFound)
+            abort();
     }
     #ifdef DEBUGDNS
     checkCorruption();
@@ -1931,6 +1941,28 @@ void Dns::checkCorruption()
             std::cerr << __FILE__ << ":" << __LINE__ << " queryId: " << queryId <<  " time count " << query.retryTime << ">" << Dns::dns->dnsServerList.size()*Dns::dns->retryBeforeError() << " (abort)" << std::endl;
             abort();
         }
+        #ifdef DEBUGFASTCGI
+        unsigned int index=0;
+        while(index<query.http.size())
+        {
+            if(Http::toDebug.find(query.http.at(index))==Http::toDebug.cend())
+            {
+                std::cerr << __FILE__ << ":" << __LINE__ << " queryId: " << queryId <<  " client: " << query.http.at(index) << " not found into http list (abort)" << std::endl;
+                abort();
+            }
+            index++;
+        }
+        index=0;
+        while(index<query.https.size())
+        {
+            if(Http::toDebug.find(query.https.at(index))==Http::toDebug.cend())
+            {
+                std::cerr << __FILE__ << ":" << __LINE__ << " queryId: " << queryId <<  " client: " << query.https.at(index) << " not found into https list (abort)" << std::endl;
+                abort();
+            }
+            index++;
+        }
+        #endif
     }
     const std::map<uint64_t,std::vector<uint16_t>> queryByNextDueTime=Dns::dns->queryByNextDueTime;
     for (auto const &x : queryByNextDueTime)

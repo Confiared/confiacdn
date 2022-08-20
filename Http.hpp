@@ -7,7 +7,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "EpollObject.hpp"
 #include "Backend.hpp"
 
 class Client;
@@ -37,6 +36,7 @@ public:
     void flushRead();
     void disconnectFrontend(const bool &force);
     virtual std::unordered_map<std::string,Http *> &pathToHttpList();
+    std::string get_host() const;
     void disconnectBackend(const bool fromDestructor=false);
     const int &getAction() const;
     int write(const char * const data, const size_t &size);

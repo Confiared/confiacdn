@@ -70,7 +70,7 @@ public:
     bool wasTCPConnected;
     const static SSL_METHOD *meth;
 private:
-    uint64_t lastReceivedBytesmsTimestamps;
+    uint64_t lastActivitymsTimestamps;
     std::string bufferSocket;
 
 public:
