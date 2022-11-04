@@ -949,12 +949,13 @@ bool Dns::read8Bits(uint8_t &var, const char * const data, const int &size, int 
     return true;
 }
 
-bool Dns::read16Bits(uint16_t &var, const char * const data, const int &size, int &pos)
+bool Dns::read16Bits(uint16_t &var, const char *const data, const int &size, int &pos)
 {
-    uint16_t t=0;
-    read16BitsRaw(t,data,size,pos);
-    var=be16toh(t);
-    return var;
+    uint16_t t = 0;
+    if(!read16BitsRaw(t, data, size, pos))
+        return false;
+    var = be16toh(t);
+    return true;
 }
 
 bool Dns::read16BitsRaw(uint16_t &var, const char * const data, const int &size, int &pos)
