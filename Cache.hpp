@@ -36,7 +36,7 @@ public:
 
     //why this method?
     static void newFD(const int &fd, void *pointer, const EpollObject::Kind &kind);
-    static void closeFD(const int &fd);
+    static void unregisterCacheFD(const int &fd);
     struct FDSave {
         void * pointer;
         EpollObject::Kind kind;

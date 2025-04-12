@@ -11,22 +11,21 @@ CheckTimeout::CheckTimeout()
 void CheckTimeout::exec()
 {
     for( const auto &n : Backend::addressToHttp )
-        for( const auto &m : n.second->busy )
+        for( Backend * p : n.second->busy )
         {
-            Backend * p=m;
             if(p!=nullptr)
             {
                 #ifdef DEBUGFASTCGI
                 /*non sens, can just be disconnected, check data coerancy taking care if connected or not
                 if(!p->isValid())
                 {
-                    std::cerr << (void *)p << " !p->isValid() into busy list, error http (abort)" << std::endl;
+                    std::cerr << (void *)p << " !p->isValid() into busy list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
                     abort();
                 }*/
                 /*can be busy but client/http disconnected
                  * if(p->http==nullptr)
                 {
-                    std::cerr << (void *)p << " p->http==null into busy list, error http (abort)" << std::endl;
+                    std::cerr << (void *)p << " p->http==null into busy list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
                     abort();
                 }*/
                 if(p->backendList!=n.second)
@@ -39,22 +38,21 @@ void CheckTimeout::exec()
             }
         }
     for( const auto &n : Backend::addressToHttps )
-        for( const auto &m : n.second->busy )
+        for( Backend * p : n.second->busy )
         {
-            Backend * p=m;
             if(p!=nullptr)
             {
                 #ifdef DEBUGFASTCGI
                 /*non sens, can just be disconnected, check data coerancy taking care if connected or not
                 if(!p->isValid())
                 {
-                    std::cerr << (void *)p << " !p->isValid() into busy list, error https (abort)" << std::endl;
+                    std::cerr << (void *)p << " !p->isValid() into busy list, error https (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
                     abort();
                 }*/
                 /*can be busy but client/http disconnected
                 if(p->http==nullptr)
                 {
-                    std::cerr << (void *)p << " p->http==null into busy list, error https (abort)" << std::endl;
+                    std::cerr << (void *)p << " p->http==null into busy list, error https (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
                     abort();
                 }*/
                 if(p->backendList!=n.second)
@@ -76,10 +74,10 @@ void CheckTimeout::exec()
             else
             {
                 #ifdef DEBUGFASTCGI
-                std::cerr << "CheckTimeout::exec() client not valid, disconnect: " << (void *)n << std::endl;
+                std::cerr << "CheckTimeout::exec() client not valid, disconnect: " << (void *)n << " fd: " << n->getFD() << std::endl;
                 #endif
                 n->disconnect();
-                Client::toDelete.insert(n);
+                Client::clientToDelete.insert(n);
                 //removeFromClientList.push_back(n);
             }
         }

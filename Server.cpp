@@ -116,7 +116,7 @@ void Server::parseEvent(const epoll_event &)
             std::cerr << __FILE__ << ":" << __LINE__ << std::endl;
             #endif
             client->disconnect();
-            delete client;
+            //delete client; -> generate use after free bug
         }
     }
 }

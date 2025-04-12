@@ -77,7 +77,7 @@ void Cache::close()
     #endif
     if(fd!=-1)
     {
-        Cache::closeFD(fd);
+        Cache::unregisterCacheFD(fd);
         epoll_ctl(epollfd,EPOLL_CTL_DEL, fd, NULL);
         #ifdef DEBUGFASTCGI
         std::cerr << "close() fd: " << fd << " " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
@@ -569,48 +569,44 @@ void Cache::newFD(const int &fd,void * pointer,const EpollObject::Kind &kind)
     //std::cerr << "Cache::newFD(" << fd << "," << pointer << "," << std::to_string((int)kind) << ")" << std::endl;
     #endif
     //work around bug FD leak or bad FD stuff from this software I think
+    #ifdef DEBUGFASTCGI
     if(FDList.find(fd)!=FDList.cend())
     {
         const FDSave &entry=FDList.at(fd);
         switch (entry.kind) {
         case EpollObject::Kind::Kind_Backend:
-            std::cerr << "WorkAround bug Backend fd: " << fd << " " << entry.pointer << std::endl;
-            static_cast<Backend *>(entry.pointer)->workAroundBug();
-            static_cast<Backend *>(entry.pointer)->close();
+            std::cerr << __FILE__ << ":" << __LINE__ << " Cache::newFD() WARN WorkAround bug Backend fd: " << fd << " " << entry.pointer << std::endl;
             break;
         case EpollObject::Kind::Kind_Cache:
-            std::cerr << "WorkAround bug Cache fd: " << fd << " " << entry.pointer << std::endl;
-            static_cast<Backend *>(entry.pointer)->workAroundBug();
-            static_cast<Cache *>(entry.pointer)->close();
+            std::cerr << __FILE__ << ":" << __LINE__ << " Cache::newFD() WARN WorkAround bug Cache fd: " << fd << " " << entry.pointer << std::endl;
             break;
         case EpollObject::Kind::Kind_Client:
-            std::cerr << "WorkAround bug Client fd: " << fd << " " << entry.pointer << std::endl;
-            static_cast<Backend *>(entry.pointer)->workAroundBug();
-            static_cast<Client *>(entry.pointer)->disconnect();
+            std::cerr << __FILE__ << ":" << __LINE__ << " Cache::newFD() WARN WorkAround bug Client fd: " << fd << " " << entry.pointer << std::endl;
             break;
         case EpollObject::Kind::Kind_Dns:
-            std::cerr << "WorkAround bug Dns fd: " << fd << " " << entry.pointer << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " Cache::newFD() WARN WorkAround bug Dns fd: " << fd << " " << entry.pointer << std::endl;
             break;
         case EpollObject::Kind::Kind_Server:
-            std::cerr << "WorkAround bug Server fd: " << fd << " " << entry.pointer << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " Cache::newFD() WARN WorkAround bug Server fd: " << fd << " " << entry.pointer << std::endl;
             break;
         case EpollObject::Kind::Kind_ServerTCP:
-            std::cerr << "WorkAround bug ServerTCP fd: " << fd << " " << entry.pointer << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " Cache::newFD() WARN WorkAround bug ServerTCP fd: " << fd << " " << entry.pointer << std::endl;
             break;
         case EpollObject::Kind::Kind_Timer:
-            std::cerr << "WorkAround bug Timer fd: " << fd << " " << entry.pointer << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " Cache::newFD() WARN WorkAround bug Timer fd: " << fd << " " << entry.pointer << std::endl;
             break;
         default:
             break;
         }
     }
+    #endif
     FDSave entry;
     entry.kind=kind;
     entry.pointer=pointer;
     FDList[fd]=entry;
 }
 
-void Cache::closeFD(const int &fd)
+void Cache::unregisterCacheFD(const int &fd)
 {
     if(fd<0)
         return;

@@ -4,6 +4,7 @@
 #ifdef DEBUGFASTCGITCP
 #include "ServerTCP.hpp"
 #endif
+#include "Common.hpp"
 #include "Client.hpp"
 #include "Http.hpp"
 #include "Dns.hpp"
@@ -58,11 +59,20 @@ int main(int argc, char *argv[])
 
     for (int i = 1; i < argc; ++i) {
         std::string argvcpp(argv[i]);
+        #ifdef DEBUGFASTCGI
+        std::cout << "Parse arg: " << argvcpp << std::endl;
+        #endif
         if (argvcpp == "--nocache") {
             #ifdef DEBUGFASTCGI
             std::cout << "Now cache is deleted when finish" << std::endl;
             #endif
             Cache::enable=false;
+        }
+        else if (argvcpp == "--forcehttpclose") {
+            #ifdef DEBUGFASTCGI
+            std::cout << "Now force http close connection after each request" << std::endl;
+            #endif
+            Backend::forceHttpClose=true;
         }
         else if (argvcpp == "--disableCompressionForBackend") {
             #ifdef DEBUGFASTCGI
@@ -80,10 +90,11 @@ int main(int argc, char *argv[])
                     std::cerr << "--nocache: to file on disk is only used to have temp file, removed at end of downloading" << std::endl;
                     std::cerr << "--http200Time=999: for http 200, time in seconds without recheck" << std::endl;
                     std::cerr << "--maxBackend=999: maximum backend to a single IP (connexion limit)" << std::endl;
+                    std::cerr << "--forcehttpclose: force http close connection after each request" << std::endl;
                     std::cerr << "--disableCompressionForBackend: disable request http compression for backend" << std::endl;
                     std::cerr << "--disableStreaming: disable streaming detection and replay" << std::endl;
-                    //std::cerr << "--maxiumSizeToBeSmallFile: (TODO) if smaller than this size, save into memory" << std::endl;
-                    //std::cerr << "--maxiumSmallFileCacheSize: (TODO) The maximum content stored in memory, this cache prevent syscall and disk seek" << std::endl;
+                    //std::cerr << "--maxiumSizeToBeSmallFile: (TODO) if smaller than this size, save into RAM, performance features where syscall have time more check and is slower (few bandwith is lost if restart/redownload, too small content, but hurge performance impact)" << std::endl;
+                    //std::cerr << "--maxiumSmallFileCacheSize: (TODO) The maximum content stored in RAM, this cache prevent syscall and disk seek, performance features where syscall have time more check and is slower (few bandwith is lost if restart/redownload, too small content, but hurge performance impact)" << std::endl;
                     return 1;
         }
         else
@@ -98,11 +109,16 @@ int main(int argc, char *argv[])
                     std::cout << "Now Cache::http200Time is " << Cache::http200Time << "s" << std::endl;
                     #endif
                 }
-                else if (var=="--maxBackend") {
+                else if (var=="--maxBackend") { //--maxBackend=64
                     Backend::maxBackend=std::stoi(val);
                     #ifdef DEBUGFASTCGI
                     std::cout << "Now Backend::maxBackend is " << Backend::maxBackend << std::endl;
                     #endif
+                }
+                else
+                {
+                    std::cout << "Parameter unknown: " << var << std::endl;
+                    return 1;
                 }
             }
         }
@@ -243,52 +259,66 @@ int main(int argc, char *argv[])
         for(Client * client : oldDeleteClient)
         {
             #ifdef DEBUGFASTCGI
-            std::cerr << "Try delete Client " << (void *)client << std::endl;
-            if(Client::toDebug.find(client)==Client::toDebug.cend())
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << "Try delete Client " << (void *)client << std::endl;
+            if(Client::clientToDebug.find(client)==Client::clientToDebug.cend())
             {
-                std::cerr << "delete Client failed, not found into debug " << (void *)client << " (abort)" << std::endl;
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete Client failed, not found into debug " << (void *)client << " (abort)" << std::endl;
                 //abort();
             }
             else
             #endif
             if(Client::clients.find(client)==Client::clients.cend())
             {
-                std::cerr << "delete Client failed, not found into debug " << (void *)client << " (abort)" << std::endl;
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete Client failed, not found into debug " << (void *)client << " (abort)" << std::endl;
                 //abort();
             }
             else
             {
                 #ifdef DEBUGFASTCGI
-                std::cerr << "delete Client " << (void *)client << std::endl;
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete Client " << (void *)client << std::endl;
                 #endif
                 delete client;
+                #ifdef DEBUGFASTCGI
+                //do into the destructor
+                //Client::clientToDebug.erase(client);
+                //CHECK IF DELETE LOOP! IF THE DESTRUCTOR insert again the object into toDelete list!
+                if(Client::clientToDelete.find(client)!=Client::clientToDelete.cend())
+                {
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << "DOBLE DELETE LOOP! THE DESTRUCTOR insert again the object into toDelete list! " << (void *)client << " (abort)" << std::endl;
+                    abort();
+                }
+                #endif
             }
         }
         for(Backend * b : oldDeleteBackend)
         {
             #ifdef DEBUGFASTCGI
-            if(Backend::toDebug.find(b)==Backend::toDebug.cend())
+            if(Backend::backendToDebug.find(b)==Backend::backendToDebug.cend())
             {
-                std::cerr << "delete Backend failed, not found into debug " << (void *)b << " (abort)" << std::endl;
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete Backend failed, not found into debug " << (void *)b << " (abort)" << std::endl;
                 abort();
             }
             #endif
             #ifdef DEBUGFASTCGI
-            std::cerr << "delete backend " << (void *)b << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete backend " << (void *)b << std::endl;
             #endif
             delete b;
+            #ifdef DEBUGFASTCGI
+            //do into the destructor
+            //Backend::backendToDebug.erase(b);
+            #endif
         }
         for(Http * r : oldDeleteHttp)
         {
             #ifdef DEBUGFASTCGI
-            if(Http::toDebug.find(r)==Http::toDebug.cend())
+            if(Http::httpToDebug.find(r)==Http::httpToDebug.cend())
             {
-                std::cerr << "delete Http failed, not found into debug " << (void *)r << " (abort)" << std::endl;
-                abort();
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete Http failed, not found into debug " << (void *)r << " time: " << Common::msFrom1970() << " (abort)" << std::endl;
+                //abort();
             }
             #endif
             #ifdef DEBUGFASTCGI
-            std::cerr << "delete http " << (void *)r << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete http " << (void *)r << " time: " << Common::msFrom1970() << std::endl;
             #endif
             if(r->get_status()==Http::Status::Status_WaitDns)
             {
@@ -302,8 +332,31 @@ int main(int argc, char *argv[])
             Dns::checkCorruption();
             #endif
             delete r;
+            #ifdef DEBUGFASTCGI
+            //do into the destructor
+            //Http::httpToDebug.erase(r);
+            #endif
             #ifdef DEBUGDNS
             Dns::checkCorruption();
+            //do into the destructor
+            /*if(Http::httpToDelete.find(r)!=Http::httpToDelete.cend())
+            {
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete http loop" << (void *)r << " (abort)" << std::endl;
+                abort();
+            }*/
+            #endif
+            #ifdef DEBUGFASTCGI
+            if(Http::httpToDebug.find(r)!=Http::httpToDebug.cend())
+            {
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << "delete Http failed, found after delete into debug " << (void *)r << " (abort)" << std::endl;
+                //abort();
+            }
+            //CHECK IF DELETE LOOP! IF THE DESTRUCTOR insert again the object into toDelete list!
+            if(Http::httpToDelete.find(r)!=Http::httpToDelete.cend())
+            {
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << "DOBLE DELETE LOOP! THE DESTRUCTOR insert again the object into toDelete list! " << (void *)r << " (abort)" << std::endl;
+                abort();
+            }
             #endif
         }
         #ifdef DEBUGDNS
@@ -320,6 +373,9 @@ int main(int argc, char *argv[])
             #ifdef DEBUGFASTCGI
             Http::checkIngrityHttpClient();
             #endif
+            #ifdef DEBUGFASTCGI
+            Backend::checkBackend();
+            #endif
             #ifdef DEBUGDNS
             Dns::dns->checkCorruption();
             #endif
@@ -335,7 +391,7 @@ int main(int argc, char *argv[])
                 case EpollObject::Kind::Kind_Client:
                 {
                     #ifdef DEBUGFASTCGI
-                    std::cerr << "Event on Client " << e.data.ptr << std::endl;
+                    std::cerr << "Event on Client " << e.data.ptr << " e.events: " << e.events << " time: " << Common::msFrom1970() << std::endl;
                     #endif
                     Client * client=static_cast<Client *>(e.data.ptr);
                     client->parseEvent(e);
@@ -357,7 +413,14 @@ int main(int argc, char *argv[])
                     /*if(!http->toRemove.empty())
                         newDeleteHttp.insert(newDeleteHttp.end(),http->toRemove.cbegin(),http->toRemove.cend());*/
                     if(!backend->isValid())
+                    {
+                        #ifdef DEBUGFASTCGI
+                        std::cerr << "Event on Backend " << e.data.ptr << " e.events: " << e.events << " time: " << Common::msFrom1970() << " now delete" << std::endl;
+                        #endif
+                        backend->close();
+                        backend->remoteSocketClosed();
                         newDeleteBackend.push_back(backend);
+                    }
                 }
                 break;
                 case EpollObject::Kind::Kind_Dns:
@@ -386,14 +449,25 @@ int main(int argc, char *argv[])
             #ifdef DEBUGFASTCGI
             Http::checkIngrityHttpClient();
             #endif
+            #ifdef DEBUGFASTCGI
+            Backend::checkBackend();
+            #endif
             #ifdef DEBUGDNS
             Dns::dns->checkCorruption();
             #endif
         }
-        newDeleteClient.insert(Client::toDelete.begin(),Client::toDelete.end());
-        Client::toDelete.clear();
-        newDeleteHttp.insert(Http::toDelete.begin(),Http::toDelete.end());
-        Http::toDelete.clear();
+        #ifdef DEBUGFASTCGI
+        for(Client * client : Client::clientToDelete)
+            std::cerr << "client planed to delete: " << client << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        for(Backend * b : newDeleteBackend)
+            std::cerr << "Backend planed to delete: " << b << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        for(Http * r : Http::httpToDelete)
+            std::cerr << "http planed to delete: " << r << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        #endif
+        newDeleteClient.insert(Client::clientToDelete.begin(),Client::clientToDelete.end());
+        Client::clientToDelete.clear();
+        newDeleteHttp.insert(Http::httpToDelete.begin(),Http::httpToDelete.end());
+        Http::httpToDelete.clear();
     }
 
     return 0;

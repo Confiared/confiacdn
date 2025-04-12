@@ -2,6 +2,7 @@
 #define COMMON_H
 
 #include <string>
+#include <stdint.h>
 
 class Common
 {
@@ -13,6 +14,7 @@ public:
     static void binarytoHexaC64Bits(const char * const source, char * const destination);
     static void binarytoHexaC32Bits(const char * const source, char * const destination);
     static uint64_t hexaTo64Bits(const std::string &hexa);
+    static uint64_t msFrom1970();
 };
 
 #endif // COMMON_H

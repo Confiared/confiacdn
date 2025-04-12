@@ -22,9 +22,9 @@
 #endif
 
 #ifdef DEBUGFASTCGI
-std::unordered_set<Http *> Http::toDebug;
+std::unordered_set<Http *> Http::httpToDebug;
 #endif
-std::unordered_set<Http *> Http::toDelete;
+std::unordered_set<Http *> Http::httpToDelete;
 
 //ETag -> If-None-Match
 const char rChar[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
@@ -40,6 +40,21 @@ bool Http::allowStreaming=false;
 char Http::fastcgiheaderend[];
 char Http::fastcgiheaderstdout[];
 
+std::string gen_random(const int len) {
+    static const char alphanum[] =
+        "123456789"
+        "ABCDEFGHJKMNPQRSTUVWXYZ"
+        "abcdefghijkmnpqrstuvwxyz";
+    std::string tmp_s;
+    tmp_s.reserve(len);
+
+    for (int i = 0; i < len; ++i) {
+        tmp_s += alphanum[rand() % (sizeof(alphanum) - 1)];
+    }
+
+    return tmp_s;
+}
+
 Http::Http(const int &cachefd, //0 if no old cache file found
            const std::string &cachePath, Client *client) :
     cachePath(cachePath),//to remove from Http::pathToHttp
@@ -52,6 +67,7 @@ Http::Http(const int &cachefd, //0 if no old cache file found
     http_code(0),
     parsing(Parsing_None),
     gzip(false),
+    retryCount(0),
     pending(false),
     requestSended(false),
     headerWriten(false),
@@ -60,22 +76,17 @@ Http::Http(const int &cachefd, //0 if no old cache file found
     contentLengthPos(-1),
     chunkLength(-1)
 {
-    #ifdef DEBUGFASTCGI
-    /* to fix:
-     * Conditional jump or move depends on uninitialised value(s)
-     * Http::checkBackend() (Http.cpp:2697) */
     memset(&m_socket,0,sizeof(m_socket));
     memset(&m_socket.sin6_addr,0,sizeof(m_socket.sin6_addr));
-    #endif
 
     status=Status_Idle;
     #ifdef DEBUGFASTCGI
-    toDebug.insert(this);
+    httpToDebug.insert(this);
     #endif
     endDetected=false;
     fileMoved=false;
     streamingDetected=false;
-    lastReceivedBytesTimestamps=Backend::msFrom1970();
+    lastReceivedBytesTimestamps=Common::msFrom1970();
     #ifdef DEBUGFASTCGI
     if(&pathToHttpList()==&Http::pathToHttp)
         std::cerr << "contructor http " << this << " uri: " << uri << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << ": " << __FILE__ << ":" << __LINE__ << std::endl;
@@ -122,17 +133,19 @@ Http::Http(const int &cachefd, //0 if no old cache file found
 /// \bug never call! memory leak
 Http::~Http()
 {
+    if(!uri.empty() && !endDetected)
+        std::cerr << "Client::~Client() !uri.empty() && !endTriggered: " << uri << std::endl;
     #ifdef DEBUGFASTCGI
-    if(toDebug.find(this)!=toDebug.cend())
-        toDebug.erase(this);
+    if(httpToDebug.find(this)!=httpToDebug.cend())
+        httpToDebug.erase(this);
     else
     {
-        std::cerr << "Http Entry not found into global list, abort()" << std::endl;
+        std::cerr << this << ": " << __FILE__ << ":" << __LINE__ << " Http Entry not found into global list, abort()" << std::endl;
         abort();
     }
     #endif
     #ifdef DEBUGFASTCGI
-    std::cerr << "Http::~Http(): destructor " << this << " uri: " << uri << " " << status << " " << __FILE__ << ":" << __LINE__ << std::endl;
+    std::cerr << "Http::~Http(): destructor " << this << " uri: " << uri << " status: " << (int)status << " " << __FILE__ << ":" << __LINE__ << std::endl;
     Backend *b=backend;
     #endif
 
@@ -151,9 +164,24 @@ Http::~Http()
         Http::checkIngrityHttpClient();
         #endif
     }
+    #ifdef DEBUGDNS
+    //very heavy check
+    if(Dns::dns->queryHaveThisClient(this))
+    {
+        std::cerr << "Http::disconnectBackend(): remain http " << this << " on dns " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
+        abort();
+    }
+    #endif
 
-    delete tempCache;
-    tempCache=nullptr;
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
+    if(tempCache!=nullptr)
+    {
+        delete tempCache;
+        tempCache=nullptr;
+    }
+
     disconnectFrontend(true);
     disconnectBackend(true);
     for(Client * client : clientsList)
@@ -195,11 +223,12 @@ Http::~Http()
                 abort();
             }
     }
-    if(Http::toDelete.find(this)!=Http::toDelete.cend())
+    if(Http::httpToDelete.find(this)!=Http::httpToDelete.cend())
     {
-        std::cerr << "Http::~Http(): destructor post opt can't have this into Http::toDelete " << this << __FILE__ << ":" << __LINE__ << std::endl;
+        std::cerr << "Http::~Http(): destructor post opt can't have this into Http::httpToDelete " << this << __FILE__ << ":" << __LINE__ << std::endl;
         abort();
     }
+    Http::httpToDelete.erase(this);
     if(b!=nullptr)
     {
         if(b->http==this)
@@ -209,6 +238,68 @@ Http::~Http()
         }
     }
     #endif
+
+    //to be safe, delete when all is stable
+    for( const auto &n : Backend::addressToHttp )
+    {
+        for( const auto &m : n.second->busy )
+        {
+            if(m->http==this)
+            {
+                std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                abort();
+            }
+        }
+        for( const auto &m : n.second->idle )
+        {
+            if(m->http==this)
+            {
+                std::cerr << (void *)m << " p->http==" << this << " into idle list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                abort();
+            }
+        }
+        unsigned int index=0;
+        while(index<n.second->pending.size())
+        {
+            if(n.second->pending.at(index)==this)
+            {
+                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " workaround activated, ERROR should not be exists, backend not correctly unregistred" << std::endl;
+                n.second->pending.erase(n.second->pending.cbegin()+index);
+            }
+            else
+                index++;
+        }
+    }
+    for( const auto &n : Backend::addressToHttps )
+    {
+        for( const auto &m : n.second->busy )
+        {
+            if(m->http==this)
+            {
+                std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                abort();
+            }
+        }
+        for( const auto &m : n.second->idle )
+        {
+            if(m->http==this)
+            {
+                std::cerr << (void *)m << " p->http==" << this << " into idle list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                abort();
+            }
+        }
+        unsigned int index=0;
+        while(index<n.second->pending.size())
+        {
+            if(n.second->pending.at(index)==this)
+            {
+                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " workaround activated, ERROR should not be exists, backend not correctly unregistred" << std::endl;
+                n.second->pending.erase(n.second->pending.cbegin()+index);
+            }
+            else
+                index++;
+        }
+    }
 }
 
 bool Http::tryConnect(const std::string &host, const std::string &uri, const bool &gzip, const std::string &etag)
@@ -240,6 +331,9 @@ bool Http::tryConnect(const std::string &host, const std::string &uri, const boo
         #endif
         parseNonHttpError(Backend::NonHttpError_DnsOverloaded);
         disconnectFrontend(true);
+        #ifdef DEBUGFASTCGI
+        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+        #endif
         disconnectBackend();
         #ifdef DEBUGFASTCGI
         Http::checkIngrityHttpClient();
@@ -263,6 +357,8 @@ void Http::dnsError()
         return;
     }
     status=Status_WaitTheContent;
+    if(!isAlive())
+        return;
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
     #endif
@@ -279,6 +375,9 @@ void Http::dnsError()
     disconnectFrontend(true);
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
+    #endif
+    #ifdef DEBUGFASTCGI
+    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
     #endif
     disconnectBackend();
     #ifdef DEBUGFASTCGI
@@ -297,6 +396,8 @@ void Http::dnsWrong()
         return;
     }
     status=Status_WaitTheContent;
+    if(!isAlive())
+        return;
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
     #endif
@@ -314,6 +415,9 @@ void Http::dnsWrong()
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
     #endif
+    #ifdef DEBUGFASTCGI
+    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+    #endif
     disconnectBackend();
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
@@ -327,14 +431,16 @@ void Http::dnsRight(const sockaddr_in6 &sIPv6)
         /*std::cerr << "Http::dnsRight() status!=Status_WaitDns " << __FILE__ << ":" << __LINE__ << std::endl;
         abort();*/
         //now it's just a warning
-        std::cerr << "Http::dnsRight() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
+        std::cerr << "Http::dnsRight() status!=Status_WaitDns: " << (int)status << " " << __FILE__ << ":" << __LINE__ << " " << this << " time: " << Common::msFrom1970() << std::endl;
         return;
     }
     status=Status_WaitTheContent;
+    if(!isAlive())
+        return;
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
     #endif
-    lastReceivedBytesTimestamps=Backend::msFrom1970();
+    lastReceivedBytesTimestamps=Common::msFrom1970();
     #ifdef DEBUGFASTCGI
     char str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &sIPv6.sin6_addr, str, INET6_ADDRSTRLEN);
@@ -342,19 +448,17 @@ void Http::dnsRight(const sockaddr_in6 &sIPv6)
     if(Dns::dns->hardcodedDns.find(host)!=Dns::dns->hardcodedDns.cend())
         if(std::string(str)!=Dns::dns->hardcodedDns.at(host))
         {
-            std::cerr << host << ": " << str << " corruption detected by hard coded value (abort) " << __FILE__ << ":" << __LINE__ << std::endl;
+            std::cerr << host << ": " << str << " corruption detected by hard coded value (abort) " << __FILE__ << ":" << __LINE__ << " time: " << Common::msFrom1970() << std::endl;
             abort();
         }
     #endif
-    std::cerr << this << ": Http::dnsRight() " << host << ": " << str << " url: " << getUrl() << " " << __FILE__ << ":" << __LINE__ << std::endl;
+    std::cerr << this << ": Http::dnsRight() " << host << ": " << str << " url: " << getUrl() << " " << __FILE__ << ":" << __LINE__ << " time: " << Common::msFrom1970() << std::endl;
     #endif
-    #ifdef DEBUGFASTCGI
     m_socket=sIPv6;
-    #endif
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
     #endif
-    tryConnectInternal(sIPv6);
+    tryConnectInternal(m_socket);
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
     #endif
@@ -378,7 +482,42 @@ bool Http::tryConnectInternal(const sockaddr_in6 &s)
     inet_ntop(AF_INET6, &s.sin6_addr, str, INET6_ADDRSTRLEN);
     std::cerr << this << ": Http::tryConnectInternal " << host << ": " << str << " url: " << getUrl() << " " << __FILE__ << ":" << __LINE__ << std::endl;
     #endif
+    if(backend!=nullptr)
+    {
+        #ifdef DEBUGFASTCGI
+        //if this can be located into another backend, then error
+        for( const auto& n : Backend::addressToHttp )
+        {
+            const Backend::BackendList * list=n.second;
+            for(const Backend * b : list->busy)
+                if(b->http==this)
+                {
+                    std::cerr << this << ": backend->http==this, http backend: " << backend << " " << getUrl() << " (abort)" << std::endl;
+                    abort();
+                }
+        }
+        for( const auto& n : Backend::addressToHttps )
+        {
+            const Backend::BackendList * list=n.second;
+            for(const Backend * b : list->busy)
+                if(b->http==this)
+                {
+                    std::cerr << this << ": backend->http==this, https backend: " << backend << " " << getUrl() << " (abort)" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+        }
+        #endif
+        #ifdef DEBUGFASTCGI
+        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+        #endif
+        disconnectBackend();
+    }
     backend=Backend::tryConnectHttp(s,this,connectInternal,&backendList);
+    if(backendList==nullptr)
+    {
+        std::cerr << this << " Http::tryConnectInternal() call Backend::tryConnectHttp() should at least set backendList" << " " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
+        abort();
+    }
     if(backend==nullptr)
     {
         #ifdef DEBUGFASTCGI
@@ -386,10 +525,7 @@ bool Http::tryConnectInternal(const sockaddr_in6 &s)
         char str[INET6_ADDRSTRLEN];
         if (inet_ntop(AF_INET6, &m_socket.sin6_addr, str, INET6_ADDRSTRLEN) != NULL)
             host2=str;
-        #ifdef DEBUGFASTCGI
-        const auto p1 = std::chrono::system_clock::now();
-        std::cerr << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << " " << this << ": unable to get backend for " << host << uri << " Backend::addressToHttp[" << host2 << "]" << std::endl;
-        #endif
+        std::cerr << Common::msFrom1970() << " " << this << ": unable to get backend for " << host << uri << " Backend::addressToHttp[" << host2 << "] then put in pending" << " " << __FILE__ << ":" << __LINE__ << std::endl;
 
         //check here if not backend AND free backend or backend count < max
         std::string addr((char *)&m_socket.sin6_addr,16);
@@ -461,7 +597,7 @@ bool Http::tryConnectInternal(const sockaddr_in6 &s)
         #endif
     }
     #ifdef DEBUGFASTCGI
-    std::cerr << this << ": http->backend=" << backend << std::endl;
+    std::cerr << "[" << Common::msFrom1970() << "] " << this << ": http->backend=" << backend << " " << __FILE__ << ":" << __LINE__ << std::endl;
     #endif
     return connectInternal && backend!=nullptr;
 }
@@ -502,13 +638,10 @@ void Http::sendRequest()
         abort();
     }
     //reset lastReceivedBytesTimestamps when come from busy to pending
-    lastReceivedBytesTimestamps=Backend::msFrom1970();
+    lastReceivedBytesTimestamps=Common::msFrom1970();
 
     #ifdef DEBUGFASTCGI
-    struct timeval tv;
-    gettimeofday(&tv,NULL);
-    std::cerr << "[" << tv.tv_sec << "] ";
-    std::cerr << "Http::sendRequest() " << this << " " << __FILE__ << ":" << __LINE__ << " uri: " << uri << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << std::endl;
+    std::cerr << "[" << Common::msFrom1970() << "] " << "Http::sendRequest() " << this << " " << __FILE__ << ":" << __LINE__ << " uri: " << uri << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << std::endl;
     if(uri.empty())
     {
         std::cerr << "Http::readyToWrite(): but uri.empty()" << std::endl;
@@ -519,12 +652,17 @@ void Http::sendRequest()
     requestSended=true;
     if(etagBackend.empty())
     {
-        std::string h(std::string("GET ")+uri+" HTTP/1.1\r\nHost: "+host+"\r\nEPNOERFT: ysff43Uy\r\n");
+        std::string h(std::string("GET ")+uri);
+        if(Backend::forceHttpClose)
+            h+=" HTTP/1.1\r\nConnection: close\r\nHost: ";
+        else
+            h+=" HTTP/1.1\r\nHost: ";
+        h+=host+"\r\nEPNOERFT: ysff43Uy\r\n";
         if(Http::useCompression && gzip)
             h+="Accept-Encoding: gzip\r\n";
         h+="\r\n";
         #ifdef DEBUGFASTCGI
-        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " Http::sendRequest() etagBackend.empty() (no cache)" << std::endl;
         //std::cerr << h << std::endl;
         #endif
         if(!socketWrite(h.data(),h.size()))
@@ -537,12 +675,17 @@ void Http::sendRequest()
     }
     else
     {
-        std::string h(std::string("GET ")+uri+" HTTP/1.1\r\nHost: "+host+"\r\nEPNOERFT: ysff43Uy\r\nIf-None-Match: "+etagBackend+"\r\n");
+        std::string h(std::string("GET ")+uri);
+        if(Backend::forceHttpClose)
+            h+=" HTTP/1.1\r\nConnection: close\r\nHost: ";
+        else
+            h+=" HTTP/1.1\r\nHost: ";
+        h+=host+"\r\nEPNOERFT: ysff43Uy\r\nIf-None-Match: "+etagBackend+"\r\n";
         if(Http::useCompression && gzip)
             h+="Accept-Encoding: gzip\r\n";
         h+="\r\n";
         #ifdef DEBUGFASTCGI
-        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " Http::sendRequest() etagBackend set to \"" << etagBackend << "\" (cache found)" << std::endl;
         //std::cerr << h << std::endl;
         #endif
         if(!socketWrite(h.data(),h.size()))
@@ -566,7 +709,8 @@ char Http::randomETagChar(uint8_t r)
     return rChar[r%rCharSize];
 }
 
-void Http::readyToRead()
+//true if have read something
+bool Http::readyToRead()
 {
 /*    if(var=="content-length")
     if(var=="content-type")*/
@@ -584,8 +728,9 @@ void Http::readyToRead()
             #endif
             size=socketRead(Http::buffer,sizeof(Http::buffer));
         }
-        return;
+        return false;
     }
+    bool haveReadSomething=false;
 
     uint16_t offset=0;
     if(!headerBuff.empty())
@@ -601,6 +746,8 @@ void Http::readyToRead()
     do
     {
         errno=0;
+        if(backend==nullptr)//stop, finish to read, else you will have problem in check into socketRead()
+            return true;
         //disable to debug
         const ssize_t size=socketRead(buffer+offset,sizeof(buffer)-offset);
         readSize=size;
@@ -609,18 +756,21 @@ void Http::readyToRead()
         #endif
         if(size>0)
         {
+            haveReadSomething=true;
             if(status!=Status_WaitTheContent)
             {
                 std::cerr << "Http::readyToRead() status!=Status_WaitTheContent " << __FILE__ << ":" << __LINE__ << std::endl;
                 abort();
             }
-            lastReceivedBytesTimestamps=Backend::msFrom1970();
-            std::cout << "Stream block: " << Common::binarytoHexa(buffer,size) << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            lastReceivedBytesTimestamps=Common::msFrom1970();
+            #ifdef DEBUGFASTCGI
+            //std::cout << "Stream block: " << Common::binarytoHexa(buffer,size) << " lastReceivedBytesTimestamps: " << lastReceivedBytesTimestamps << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            #endif
             if(parsing==Parsing_Content)
             {
-                write(buffer,size);
+                writeToCache(buffer,size);
                 if(endDetected)
-                    return;
+                    return haveReadSomething;
             }
             else
             {
@@ -644,17 +794,19 @@ void Http::readyToRead()
                                 c=0x00;
                                 http_code=atoi((char *)fh);
                                 #ifdef DEBUGFASTCGI
-                                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " http code: " << http_code << " (" << fh << ") headerBuff.empty(): " << std::to_string(headerBuff.empty()) << " data: " << Common::binarytoHexa(buffer,size) << std::endl;
+                                //std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " http code: " << http_code << " (" << fh << ") headerBuff.empty(): " << std::to_string(headerBuff.empty()) << " data (" << buffer << "," << size << "): " << Common::binarytoHexa(buffer,size) << std::endl;
+                                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " http code: " << http_code << " (" << fh << ") backend: " << backend << std::endl;
                                 #endif
                                 if(backend!=nullptr)
                                     backend->wasTCPConnected=true;
                                 if(!HttpReturnCode(http_code))
                                 {
-                                    flushRead();
                                     #ifdef DEBUGFASTCGI
-                                    std::cout << __FILE__ << ":" << __LINE__ << "readyToRead() !HttpReturnCode(http_code)" << std::endl;
+                                    std::cout << __FILE__ << ":" << __LINE__ << " readyToRead() !HttpReturnCode(http_code) backend: " << backend << " http_code: " << http_code << std::endl;
                                     #endif
-                                    return;
+                                    if(backend!=nullptr)
+                                        flushRead();
+                                    return haveReadSomething;
                                 }
                                 pos++;
                             }
@@ -665,14 +817,15 @@ void Http::readyToRead()
                 }
                 if(http_code!=200)
                 {
-                    flushRead();
+                    if(backend!=nullptr)
+                        flushRead();
                     #ifdef DEBUGFASTCGI
-                    std::cout << __FILE__ << ":" << __LINE__ << std::endl;
+                    std::cout << __FILE__ << ":" << __LINE__ << " http code !=200 then flushRead, backend: " << backend << std::endl;
                     #endif
-                    return;
+                    return haveReadSomething;
                 }
                 #ifdef DEBUGFASTCGI
-                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " finish get http code" << std::endl;
                 #endif
                 pos++;
 
@@ -844,14 +997,15 @@ void Http::readyToRead()
                                     tempCache=nullptr;
                                     delete tempCache;
                                 }
+                                tempPath=cachePath+gen_random(16)+".tmp";
                                 #ifdef DEBUGFASTCGI
-                                std::cout << "open((cachePath+.tmp).c_str() " << (cachePath+".tmp") << std::endl;
+                                std::cout << "open(tempPath.c_str() " << tempPath << std::endl;
                                 #endif
-                                ::unlink((cachePath+".tmp").c_str());
+                                ::unlink(tempPath.c_str());
                                 #ifdef DEBUGFASTCGI
-                                std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+                                std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
                                 #endif
-                                int cachefd = open((cachePath+".tmp").c_str(), O_RDWR | O_CREAT | O_TRUNC/* | O_NONBLOCK*/, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+                                int cachefd = open(tempPath.c_str(), O_RDWR | O_CREAT | O_TRUNC/* | O_NONBLOCK*/, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
                                 if(cachefd==-1)
                                 {
                                     if(errno==2)
@@ -863,23 +1017,23 @@ void Http::readyToRead()
                                             mkdir(basePath.c_str(),S_IRWXU);
                                         }
                                         #endif
-                                        ::unlink((cachePath+".tmp").c_str());
+                                        ::unlink(tempPath.c_str());
                                         #ifdef DEBUGFASTCGI
-                                        std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+                                        std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
                                         #endif
-                                        cachefd = open((cachePath+".tmp").c_str(), O_RDWR | O_CREAT | O_TRUNC/* | O_NONBLOCK*/, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+                                        cachefd = open(tempPath.c_str(), O_RDWR | O_CREAT | O_TRUNC/* | O_NONBLOCK*/, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
                                         if(cachefd==-1)
                                         {
                                             #ifdef DEBUGFASTCGI
-                                            std::cout << "open((cachePath+.tmp).c_str() failed " << (cachePath+".tmp") << " errno " << errno << std::endl;
+                                            std::cout << "open((cachePath+.tmp).c_str() failed " << tempPath << " errno " << errno << std::endl;
                                             #endif
                                             //return internal error
-                                            backendError("Cache file FS access error");
+                                            backendErrorAndDisconnect("Cache file FS access error");
                                             disconnectFrontend(true);
                                             #ifdef DEBUGFASTCGI
                                             std::cout << __FILE__ << ":" << __LINE__ << std::endl;
                                             #endif
-                                            return;
+                                            return haveReadSomething;
                                         }
                                         else
                                         {
@@ -892,22 +1046,22 @@ void Http::readyToRead()
                                     else
                                     {
                                         #ifdef DEBUGFASTCGI
-                                        std::cout << "open((cachePath+.tmp).c_str() failed " << (cachePath+".tmp") << " errno " << errno << std::endl;
+                                        std::cout << "open((cachePath+.tmp).c_str() failed " << tempPath << " errno " << errno << std::endl;
                                         #endif
                                         //return internal error
-                                        backendError("Cache file FS access error");
+                                        backendErrorAndDisconnect("Cache file FS access error");
                                         disconnectFrontend(true);
                                         #ifdef DEBUGFASTCGI
                                         std::cout << __FILE__ << ":" << __LINE__ << std::endl;
                                         #endif
-                                        return;
+                                        return haveReadSomething;
                                     }
                                 }
                                 else
                                 {
                                     Cache::newFD(cachefd,this,EpollObject::Kind::Kind_Cache);
                                     #ifdef DEBUGFILEOPEN
-                                    std::cerr << "Http::readyToRead() open: " << (cachePath+".tmp") << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                                    std::cerr << "Http::readyToRead() open: " << tempPath << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
                                     #endif
                                 }
 
@@ -934,11 +1088,11 @@ void Http::readyToRead()
                                     delete tempCache;
                                     tempCache=nullptr;
                                     #ifdef DEBUGFASTCGI
-                                    std::cerr << "!tempCache->set_access_time(currentTime): " << (cachePath+".tmp") << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                                    std::cerr << "!tempCache->set_access_time(currentTime): " << tempPath << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
                                     #endif
-                                    backendError("Cache file FS access error");
-                                    disconnectBackend();
-                                    return;
+                                    backendErrorAndDisconnect("Cache file FS access error");
+                                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                    return haveReadSomething;
                                 }
                                 if(!tempCache->set_last_modification_time_check(currentTime))
                                 {
@@ -946,10 +1100,12 @@ void Http::readyToRead()
                                     delete tempCache;
                                     tempCache=nullptr;
                                     #ifdef DEBUGFASTCGI
-                                    std::cerr << "!tempCache->set_last_modification_time_check(currentTime): " << (cachePath+".tmp") << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                                    std::cerr << "!tempCache->set_last_modification_time_check(currentTime): " << tempPath << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
                                     #endif
-                                    backendError("Cache file FS access error");
-                                    disconnectBackend();
+                                    backendErrorAndDisconnect("Cache file FS access error");
+                                    #ifdef DEBUGFASTCGI
+                                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                    #endif
                                     std::cerr << this << " drop corrupted cache " << cachePath << ".tmp";
                                     {
                                         struct stat sb;
@@ -958,11 +1114,11 @@ void Http::readyToRead()
                                             std::cerr << " size: " << sb.st_size;
                                     }
                                     std::cerr << std::endl;
-                                    ::unlink((cachePath+".tmp").c_str());//drop corrupted cache
+                                    ::unlink(tempPath.c_str());//drop corrupted cache
                                     #ifdef DEBUGFASTCGI
-                                    std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+                                    std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
                                     #endif
-                                    return;
+                                    return haveReadSomething;
                                 }
                                 if(!tempCache->set_http_code(http_code))
                                 {
@@ -970,11 +1126,13 @@ void Http::readyToRead()
                                     delete tempCache;
                                     tempCache=nullptr;
                                     #ifdef DEBUGFASTCGI
-                                    std::cerr << "!tempCache->set_http_code(http_code): " << (cachePath+".tmp") << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                                    std::cerr << "!tempCache->set_http_code(http_code): " << tempPath << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
                                     #endif
-                                    backendError("Cache file FS access error");
-                                    disconnectBackend();
-                                    return;
+                                    backendErrorAndDisconnect("Cache file FS access error");
+                                    #ifdef DEBUGFASTCGI
+                                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                    #endif
+                                    return haveReadSomething;
                                 }
                                 if(!tempCache->set_ETagFrontend(r))//string of 6 char
                                 {
@@ -982,11 +1140,13 @@ void Http::readyToRead()
                                     delete tempCache;
                                     tempCache=nullptr;
                                     #ifdef DEBUGFASTCGI
-                                    std::cerr << "!tempCache->set_ETagFrontend(r): " << (cachePath+".tmp") << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                                    std::cerr << "!tempCache->set_ETagFrontend(r): " << tempPath << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
                                     #endif
-                                    backendError("Cache file FS access error");
-                                    disconnectBackend();
-                                    return;
+                                    backendErrorAndDisconnect("Cache file FS access error");
+                                    #ifdef DEBUGFASTCGI
+                                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                    #endif
+                                    return haveReadSomething;
                                 }
                                 if(!tempCache->set_ETagBackend(etagBackend))//at end seek to content pos
                                 {
@@ -994,11 +1154,13 @@ void Http::readyToRead()
                                     delete tempCache;
                                     tempCache=nullptr;
                                     #ifdef DEBUGFASTCGI
-                                    std::cerr << "!tempCache->set_ETagBackend(etagBackend): " << (cachePath+".tmp") << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                                    std::cerr << "!tempCache->set_ETagBackend(etagBackend): " << tempPath << ", fd: " << cachefd << " " << __FILE__ << ":" << __LINE__ << std::endl;
                                     #endif
-                                    backendError("Cache file FS access error");
-                                    disconnectBackend();
-                                    return;
+                                    backendErrorAndDisconnect("Cache file FS access error");
+                                    #ifdef DEBUGFASTCGI
+                                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                    #endif
+                                    return haveReadSomething;
                                 }
 
                                 std::string header;
@@ -1066,8 +1228,10 @@ void Http::readyToRead()
                                         tempCache->close();
                                         delete tempCache;
                                         tempCache=nullptr;
-                                        backendError("Cache file FS access error");
-                                        disconnectBackend();
+                                        backendErrorAndDisconnect("Cache file FS access error");
+                                        #ifdef DEBUGFASTCGI
+                                        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                        #endif
                                     }
                                     else
                                     #endif
@@ -1077,8 +1241,10 @@ void Http::readyToRead()
                                         tempCache->close();
                                         delete tempCache;
                                         tempCache=nullptr;
-                                        backendError("Cache file FS access error");
-                                        disconnectBackend();
+                                        backendErrorAndDisconnect("Cache file FS access error");
+                                        #ifdef DEBUGFASTCGI
+                                        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                        #endif
                                     }
                                     else
                                     {
@@ -1107,7 +1273,7 @@ void Http::readyToRead()
                                         else
                                         {
                                             for(Client * client : clientsList)
-                                                client->startRead(cachePath+".tmp",true);
+                                                client->startRead(tempPath,true);
                                         }
                                     }
                                 }
@@ -1197,11 +1363,11 @@ void Http::readyToRead()
                     #endif
                     //std::cerr << "content: " << std::string(buffer+pos,size-pos) << std::endl;
                     if(size<=pos)
-                        return;
+                        return haveReadSomething;
                     const size_t finalSize=size-pos;
-                    const size_t rSize=write(buffer+pos,finalSize);
+                    const size_t rSize=writeToCache(buffer+pos,finalSize);
                     if(endDetected || rSize<=0 || rSize!=finalSize)
-                        return;
+                        return haveReadSomething;
                 }
                 else
                 {
@@ -1233,7 +1399,7 @@ void Http::readyToRead()
                     }
                 }
                 #ifdef DEBUGFASTCGI
-                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " end procesing http header, backend: " << backend << std::endl;
                 #endif
             }
             /*const char *ptr = strchr(buffer,':',size);
@@ -1251,7 +1417,8 @@ void Http::readyToRead()
         }
         else
         {
-            if(errno!=11 && errno!=0)
+            /// 113: no route to the host
+            if(errno!=11 && errno!=113 && errno!=0)
             {
                 const auto p1 = std::chrono::system_clock::now();
                 // errno = 111 when The remote server have close the connexion
@@ -1273,6 +1440,7 @@ void Http::readyToRead()
     #ifdef DEBUGFASTCGI
     //std::cout << __FILE__ << ":" << __LINE__ << std::endl;
     #endif
+    return haveReadSomething;
 }
 
 void Http::readyToWrite()
@@ -1298,14 +1466,15 @@ ssize_t Http::socketRead(void *buffer, size_t size)
     if(backend==nullptr)
     {
         #ifdef DEBUGFASTCGI
-        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << "Http::socketRead error backend==nullptr" << std::endl;
+        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " Http::socketRead ERROR backend==nullptr (abort)" << std::endl;
+        abort();
         #endif
         return -1;
     }
     if(!backend->isValid())
     {
         #ifdef DEBUGFASTCGI
-        std::cerr << "Http::socketRead error backend is not valid: " << backend << std::endl;
+        std::cerr << "Http::socketRead error backend is not valid: " << backend << " " << __FILE__ << ":" << __LINE__ << std::endl;
         #endif
         return -1;
     }
@@ -1324,7 +1493,7 @@ bool Http::socketWrite(const void *buffer, size_t size)
     if(!backend->isValid())
     {
         #ifdef DEBUGFASTCGI
-        std::cerr << "Http::socketWrite error backend is not valid: " << backend << std::endl;
+        std::cerr << "Http::socketWrite error backend is not valid: " << backend << " " << __FILE__ << ":" << __LINE__ << std::endl;
         #endif
         return false;
     }
@@ -1378,7 +1547,7 @@ void Http::checkIngrityHttpClient()
         }
     }
     Dns::dns->checkCorruption();
-    for(const Http * http : Http::toDebug)
+    for(const Http * http : Http::httpToDebug)
     {
         if(http!=nullptr)
         {
@@ -1413,6 +1582,9 @@ void Http::disconnectFrontend(const bool &force)
     std::cerr << __FILE__ << ":" << __LINE__ << " post Http::disconnectFrontend() checkIngrityHttpClient()" << std::endl;
     #endif
     std::vector<Client *> clientsList=this->clientsList;//clone list, can't work on list directly because will be removed item by
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
     if(force || !endDetected)
     {
         #ifdef DEBUGFASTCGI
@@ -1463,6 +1635,20 @@ void Http::disconnectFrontend(const bool &force)
         #ifdef DEBUGFASTCGI
         //std::cerr << "disconnectFrontend post selective " << __FILE__ << ":" << __LINE__ << std::endl;
         #endif
+    }
+    if(clientsList.empty() && backend==nullptr && backendList!=nullptr)
+    {
+        unsigned int index=0;
+        while(index<backendList->pending.size())
+        {
+            if(backendList->pending.at(index)==this)
+            {
+                backendList->pending.erase(backendList->pending.cbegin()+index);
+                //break;for security
+            }
+            index++;
+        }
+        backendList=nullptr;
     }
     #ifdef DEBUGFASTCGI
     //std::cerr << "disconnectFrontend pre checkIngrityHttpClient() " << __FILE__ << ":" << __LINE__ << std::endl;
@@ -1515,7 +1701,7 @@ Http::backendError(Internal error, !haveUrlAndFrontendConnected), but pathToHttp
         std::cerr << this << " disconnectFrontend cachePath not found: " << cachePath << " " << __FILE__ << ":" << __LINE__ << std::endl;
     #endif*/
     /* can be in progress on backend {
-        std::string cachePathTmp=cachePath+".tmp";
+        std::string cachePathTmp=tempPath;
         if(!cachePathTmp.empty())
         {
             std::unordered_map<std::string,Http *> &pathToHttp=pendingList();
@@ -1539,8 +1725,11 @@ Http::backendError(Internal error, !haveUrlAndFrontendConnected), but pathToHttp
     {
         contenttype.clear();
         /*if(backend==nullptr && clientsList.empty() && !isAlive() && contenttype.empty())
-            Http::toDelete.insert(this);*/
+            Http::httpToDelete.insert(this);*/
     }
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
 }
 
 bool Http::haveUrlAndFrontendConnected() const
@@ -1574,9 +1763,9 @@ bool Http::startReadFromCacheAfter304()
             }
             std::cerr << std::endl;
             #ifdef DEBUGFASTCGI
-            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
             #endif
-            ::unlink((cachePath+".tmp").c_str());//drop corrupted cache
+            ::unlink(tempPath.c_str());//drop corrupted cache
         }
         else
             ok=true;
@@ -1618,17 +1807,64 @@ bool Http::HttpReturnCode(const int &errorCode)
     //disconnectSocket();
 }
 
-bool Http::backendError(const std::string &errorString)
+void Http::retryAfterError()
+{
+    std::cerr<< this << " " << __FILE__ << ":" << __LINE__ << " Http::retryAfterError() pending: " << pending << " requestSended: " << requestSended << " etagBackend: " << etagBackend << " status: " << (int)status << std::endl;
+
+    //failback 1
+    if(pending && requestSended && !etagBackend.empty())
+    {
+        //failback to stale cache is better than fail
+        //startReadFromCacheAfter304() -> included into HttpReturnCode() but HttpReturnCode() do error management
+        http_code=304;
+        if(!HttpReturnCode(http_code))
+        {
+            flushRead();
+            #ifdef DEBUGFASTCGI
+            std::cout << __FILE__ << ":" << __LINE__ << std::endl;
+            #endif
+        }
+        return;
+    }
+
+    //failback 2
+    if(status!=Status_WaitTheContent)
+    {
+        std::cerr<< this << " " << __FILE__ << ":" << __LINE__ << " internal status!=Status_WaitTheContent (abort)" << std::endl;
+        abort();
+    }
+    #ifdef DEBUGFASTCGI
+    checkIngrityHttpClient();
+    #endif
+    lastReceivedBytesTimestamps=Common::msFrom1970();
+    tryConnectInternal(m_socket);
+}
+
+void Http::backendErrorAndDisconnect(const std::string &errorString)
 {
     #ifdef DEBUGFASTCGI
-    std::cerr << __FILE__ << ":" << __LINE__ << " Http::backendError(" << errorString << "), erase pathToHttp.find(" << cachePath << ") " << this << std::endl;
+    std::cerr << __FILE__ << ":" << __LINE__ << " Http::backendError(\"" << errorString << "\"), erase pathToHttp.find(" << cachePath << ") " << this << " retryCount: " << (int)retryCount << " contentwritten: " << contentwritten << " backend: " << backend << std::endl;
     std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " client: ,clientsList size: " << clientsList.size();
     for(const Client * c : clientsList)
         std::cerr << " " << c;
     std::cerr << std::endl;
     #endif
+    if(retryCount<2 && contentwritten==0 && status==Status_WaitTheContent && haveUrlAndFrontendConnected())
+    {
+        retryCount++;
+        std::cerr<< this << " " << __FILE__ << ":" << __LINE__ << " retry here after error: \"" << errorString << "\" retryCount: " << (int)retryCount << " contentwritten: " << contentwritten << std::endl;
+        retryAfterError();
+        return;
+    }
+    retryCount=255;
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
     for(Client * client : clientsList)
         client->httpError(errorString);
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
     disconnectFrontend(true);
     if(!cachePath.empty())
     {
@@ -1636,18 +1872,18 @@ bool Http::backendError(const std::string &errorString)
         #ifdef DEBUGFASTCGI
         if(tempCache!=nullptr)
         {
-            if(pathToHttp.find(cachePath+".tmp")==pathToHttp.cend())
+            if(pathToHttp.find(tempPath)==pathToHttp.cend())
             {
-                std::cerr << "Http::backendError(" << errorString << "), but pathToHttp.find(" << cachePath+".tmp" << ") not found (abort) " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << "Http::backendError(" << errorString << "), but pathToHttp.find(" << tempPath << ") not found (abort) " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
                 //abort(); have low chance to pass here
             }
-            else if(pathToHttp.at(cachePath+".tmp")!=this)
+            else if(pathToHttp.at(tempPath)!=this)
             {
-                std::cerr << "Http::backendError(" << errorString << "), but pathToHttp.find(" << cachePath+".tmp" << ")!=this (abort) " << this << std::endl;
+                std::cerr << "Http::backendError(" << errorString << "), but pathToHttp.find(" << tempPath << ")!=this (abort) " << this << std::endl;
                 //abort();
             }
             else
-                std::cerr << "Http::backendError(" << errorString << "), erase pathToHttp.find(" << cachePath+".tmp" << ") " << this << std::endl;
+                std::cerr << "Http::backendError(" << errorString << "), erase pathToHttp.find(" << tempPath << ") " << this << std::endl;
         }
         if(finalCache!=nullptr)
         {
@@ -1679,11 +1915,11 @@ bool Http::backendError(const std::string &errorString)
         {
             #ifdef DEBUGFASTCGI
             if(&pathToHttp==&Http::pathToHttp)
-                std::cerr << "pathToHttp.erase(" << cachePath+".tmp" << ") " << this << std::endl;
+                std::cerr << "pathToHttp.erase(" << tempPath << ") " << this << std::endl;
             if(&pathToHttp==&Https::pathToHttps)
-                std::cerr << "pathToHttps.erase(" << cachePath+".tmp" << ") " << this << std::endl;
+                std::cerr << "pathToHttps.erase(" << tempPath << ") " << this << std::endl;
             #endif
-            pathToHttp.erase(cachePath+".tmp");
+            pathToHttp.erase(tempPath);
         }
         cachePath.clear();
     }
@@ -1707,8 +1943,14 @@ bool Http::backendError(const std::string &errorString)
             }
     }
     #endif
-    return false;
+    /// \todo should have here process the backend pending if no more retry
     //disconnectSocket();
+    #ifdef DEBUGFASTCGI
+    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+    #endif
+    if(backend!=nullptr)
+        backend->close();
+    disconnectBackend();
 }
 
 std::string Http::getUrl() const
@@ -1721,11 +1963,17 @@ std::string Http::getUrl() const
 
 void Http::flushRead()
 {
+    #ifdef DEBUGFASTCGI
+    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Http::flushRead()" << std::endl;
+    #endif
     endDetected=true;
-    disconnectFrontend(false);
-    disconnectBackend();
     while(socketRead(Http::buffer,sizeof(Http::buffer))>0)
     {}
+    disconnectFrontend(false);
+    #ifdef DEBUGFASTCGI
+    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+    #endif
+    disconnectBackend();
 }
 
 void Http::parseNonHttpError(const Backend::NonHttpError &error)
@@ -1784,9 +2032,12 @@ void Http::parseNonHttpError(const Backend::NonHttpError &error)
 void Http::disconnectBackend(const bool fromDestructor)
 {
     #ifdef DEBUGFASTCGI
-    std::cerr << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() << " Http::disconnectBackend() " << this << ", fromDestructor: " << fromDestructor <<  std::endl;
+    std::cerr << Common::msFrom1970() << " Http::disconnectBackend() " << this << ", fromDestructor: " << fromDestructor << "  " << __FILE__ << ":" << __LINE__ <<  std::endl;
+    if(retryCount<255 && !fromDestructor)
+        std::cerr << Common::msFrom1970() << " Http::disconnectBackend() WARN seam not pass here  " << __FILE__ << ":" << __LINE__ <<  std::endl;
     #endif
 
+    retryCount=255;//not retry, this disable retry from here, if you wish retry, call the retryAfterError() function
     if(finalCache!=nullptr)
     {
         #ifdef DEBUGFILEOPEN
@@ -1806,106 +2057,112 @@ void Http::disconnectBackend(const bool fromDestructor)
         if(tempSize<25)
         {
             tempCache->close();
-            std::cerr << this << " " << (cachePath+".tmp") << " corrupted temp file: " << tempCache->size() << " fd: " << tempCache->getFD() << " (abort)" << std::endl;
+            std::cerr << this << " " << tempPath << " corrupted temp file: " << tempCache->size() << " fd: " << tempCache->getFD() << " (abort)" << std::endl;
             #ifdef DEBUGFASTCGI
             std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cstr) << std::endl;
             #endif
             ::unlink(cstr);
             #ifdef DEBUGFASTCGI
-            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
             #endif
-            ::unlink((cachePath+".tmp").c_str());
+            ::unlink(tempPath.c_str());
             moveTempToFinal=false;
             //abort();
         }
         #ifdef DEBUGFASTCGI
-        std::cerr << "Http::disconnectBackend() " << (cachePath+".tmp") << " temp file size: " << tempSize << " (close)" << std::endl;
+        std::cerr << "Http::disconnectBackend() " << tempPath << " temp file size: " << tempSize << " (close)" << std::endl;
         #endif
 
         tempCache->close();
         if(moveTempToFinal)
         {
-            struct stat sb;
-            const int rstat=stat((cachePath+".tmp").c_str(),&sb);
-            if(rstat==0)
+            if(endDetected)
             {
-                if(sb.st_size<100000000)
+                struct stat sb;
+                const int rstat=stat(tempPath.c_str(),&sb);
+                if(rstat==0)
                 {
-                    if(sb.st_size>25)
+                    if(sb.st_size<100000000)
                     {
-                        #ifdef DEBUGFASTCGI
-                        std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cstr) << std::endl;
-                        #endif
-                        ::unlink(cstr);
-                        if(rename((cachePath+".tmp").c_str(),cstr)!=0)
+                        if(sb.st_size>25)
                         {
-                            if(errno==2)
+                            #ifdef DEBUGFASTCGI
+                            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cstr) << std::endl;
+                            #endif
+                            ::unlink(cstr);
+                            if(rename(tempPath.c_str(),cstr)!=0)
                             {
-                                #ifdef HOSTSUBFOLDER
+                                if(errno==2)
                                 {
-                                    const std::string::size_type &n=cachePath.rfind("/");
-                                    const std::string basePath=cachePath.substr(0,n);
-                                    mkdir(basePath.c_str(),S_IRWXU);
+                                    #ifdef HOSTSUBFOLDER
+                                    {
+                                        const std::string::size_type &n=cachePath.rfind("/");
+                                        const std::string basePath=cachePath.substr(0,n);
+                                        mkdir(basePath.c_str(),S_IRWXU);
+                                    }
+                                    #endif
+                                    if(rename(tempPath.c_str(),cstr)!=0)
+                                    {
+                                        std::cerr << "unable to move " << cachePath << ".tmp to " << cachePath << ", errno: " << errno << std::endl;
+                                        #ifdef DEBUGFASTCGI
+                                        std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
+                                        #endif
+                                        ::unlink(tempPath.c_str());
+                                    }
                                 }
-                                #endif
-                                if(rename((cachePath+".tmp").c_str(),cstr)!=0)
+                                else
                                 {
                                     std::cerr << "unable to move " << cachePath << ".tmp to " << cachePath << ", errno: " << errno << std::endl;
                                     #ifdef DEBUGFASTCGI
-                                    std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+                                    std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
                                     #endif
-                                    ::unlink((cachePath+".tmp").c_str());
+                                    ::unlink(tempPath.c_str());
                                 }
                             }
                             else
                             {
-                                std::cerr << "unable to move " << cachePath << ".tmp to " << cachePath << ", errno: " << errno << std::endl;
                                 #ifdef DEBUGFASTCGI
-                                std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+                                std::cout << __FILE__ << ":" << __LINE__ << " move: " << tempPath << " to " << cstr << std::endl;
                                 #endif
-                                ::unlink((cachePath+".tmp").c_str());
+                                fileMoved=true;
                             }
                         }
                         else
                         {
+                            std::cerr << "Too small to be saved (abort): " << tempPath << " " << __FILE__ << ":" << __LINE__ << std::endl;
                             #ifdef DEBUGFASTCGI
-                            std::cout << __FILE__ << ":" << __LINE__ << " move: " << (cachePath+".tmp") << " to " << cstr << std::endl;
+                            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cstr) << std::endl;
+                            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
                             #endif
-                            fileMoved=true;
+                            ::unlink(cstr);
+                            ::unlink(tempPath.c_str());
                         }
                     }
                     else
                     {
-                        std::cerr << "Too small to be saved (abort): " << cachePath+".tmp" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                        std::cerr << "Too big to be saved (abort): " << tempPath << " " << __FILE__ << ":" << __LINE__ << std::endl;
                         #ifdef DEBUGFASTCGI
                         std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cstr) << std::endl;
-                        std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+                        std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
                         #endif
                         ::unlink(cstr);
-                        ::unlink((cachePath+".tmp").c_str());
+                        ::unlink(tempPath.c_str());
                     }
                 }
-                else
-                {
-                    std::cerr << "Too big to be saved (abort): " << cachePath+".tmp" << " " << __FILE__ << ":" << __LINE__ << std::endl;
-                    #ifdef DEBUGFASTCGI
-                    std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cstr) << std::endl;
-                    std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
-                    #endif
-                    ::unlink(cstr);
-                    ::unlink((cachePath+".tmp").c_str());
-                }
             }
+            else
+                std::cout << __FILE__ << ":" << __LINE__ << " disconnect backend but no endDetected detected! file: " << tempPath << " url " << getUrl() << std::endl;
+            ::unlink(tempPath.c_str());
         }
         else
         {
-            std::cerr << "Not found: " << cachePath+".tmp" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            std::cerr << "Not found: " << tempPath << " " << __FILE__ << ":" << __LINE__ << std::endl;
             #ifdef DEBUGFASTCGI
             std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cstr) << std::endl;
-            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << (cachePath+".tmp") << std::endl;
+            std::cout << __FILE__ << ":" << __LINE__ << " ::unlink(" << tempPath << std::endl;
             #endif
             ::unlink(cstr);
-            ::unlink((cachePath+".tmp").c_str());
+            ::unlink(tempPath.c_str());
         }
         //disable to cache
         if(!Cache::enable)
@@ -1926,12 +2183,75 @@ void Http::disconnectBackend(const bool fromDestructor)
     #endif
     //remove from busy, should never be into idle
     if(backend!=nullptr)
-        backend->downloadFinished();
+    {
+        #ifdef DEBUGFASTCGI
+        if(backend->http!=this)
+        {
+            std::cerr << this << " " << __FILE__ << ":" << __LINE__ << ": backend->http!=this: " << backend->http << ", backend: " << backend << " backend of this http should have this http as parent (abort)" << std::endl;
+            abort();
+        }
+        #endif
+        Backend *backend=this->backend;
+        this->backend=nullptr;
+        this->backendList=nullptr;
+        backend->downloadFinished();//after this, the backend should not point to http
+        #ifdef DEBUGFASTCGI
+        if(backend!=nullptr && backend->http==this)
+        {
+            std::cerr << this << " " << __FILE__ << ":" << __LINE__ << ": backend->http==this, backend: " << backend << " backend of this http should have this http as parent (abort)" << std::endl;
+            abort();
+        }
+        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << ": backend: " << this->backend << std::endl;
+
+        //if this can be located into another backend, then error
+        for( const auto& n : Backend::addressToHttp )
+        {
+            const Backend::BackendList * list=n.second;
+            for(const Backend * b : list->busy)
+                if(b->http==this)
+                    std::cerr << this << ": backend->http==this, can be retry here after error case, http backend: " << backend << " but found in this busy backend " << b << " " << getUrl() << " (abort)" << std::endl;
+        }
+        for( const auto& n : Backend::addressToHttps )
+        {
+            const Backend::BackendList * list=n.second;
+            for(const Backend * b : list->busy)
+                if(b->http==this)
+                    std::cerr << this << ": backend->http==this, can be retry here after error case, https backend: " << backend << " but found in this busy backend " << b << " " << getUrl() << " (abort)" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        }
+        checkBackend();
+        #endif
+    }
     else
     {
         //remove from pending
         if(backendList!=nullptr)
         {
+            #ifdef DEBUGFASTCGI
+            std::cerr << this << " backendList!=nullptr but no backend, remove from pending " << __FILE__ << ":" << __LINE__ << std::endl;
+            #endif
+            #ifdef DEBUGFASTCGI
+            //if this can be located into another backend, then error
+            for( const auto& n : Backend::addressToHttp )
+            {
+                const Backend::BackendList * list=n.second;
+                for(const Backend * b : list->busy)
+                    if(b->http==this)
+                    {
+                        std::cerr << this << ": backend->http==this, http backend: " << backend << " " << getUrl() << " (abort)" << std::endl;
+                        abort();
+                    }
+            }
+            for( const auto& n : Backend::addressToHttps )
+            {
+                const Backend::BackendList * list=n.second;
+                for(const Backend * b : list->busy)
+                    if(b->http==this)
+                    {
+                        std::cerr << this << ": backend->http==this, https backend: " << backend << " " << getUrl() << " (abort)" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                        abort();
+                    }
+            }
+            #endif
             unsigned int index=0;
             while(index<backendList->pending.size())
             {
@@ -1942,19 +2262,57 @@ void Http::disconnectBackend(const bool fromDestructor)
             if(index>=backendList->pending.size())
                 std::cerr << this << " backend==nullptr and this " << this << " not found into pending, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " (abort) " << __FILE__ << ":" << __LINE__ << std::endl;
             else
+            {
                 backendList->pending.erase(backendList->pending.cbegin()+index);
+                backendList=nullptr;
+            }
         }
         else
         {
             #ifdef DEBUGFASTCGI
             std::cerr << this << " backendList==nullptr WARNING " << __FILE__ << ":" << __LINE__ << std::endl;
             #endif
+            //slow but workaround
+            for( const auto& n : Backend::addressToHttp )
+            {
+                const Backend::BackendList * list=n.second;
+                for(Backend * b : list->busy)
+                    if(b->http==this)
+                    {
+                        std::cerr << this << ": backend->http==this, http backend: " << backend << " " << getUrl() << " (abort)" << std::endl;
+                        abort();//b->http=nullptr;
+                    }
+            }
+            for( const auto& n : Backend::addressToHttps )
+            {
+                const Backend::BackendList * list=n.second;
+                for(Backend * b : list->busy)
+                    if(b->http==this)
+                    {
+                        std::cerr << this << ": backend->http==this, https backend: " << backend << " " << getUrl() << " (abort)" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                        abort();//b->http=nullptr;
+                    }
+            }
         }
     }
-    #ifdef DEBUGFASTCGI
-    if(backend!=nullptr && backend->http==this)
+    if(status==Status_WaitDns)
     {
-        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << ": backend->http==this, backend: " << backend << " (abort)" << std::endl;
+        #ifdef DEBUGFASTCGI
+        std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
+        #endif
+        Dns::dns->cancelClient(this,host,isHttps(),true);
+        #ifdef DEBUGFASTCGI
+        std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
+        #endif
+        status=Status_Idle;
+        #ifdef DEBUGFASTCGI
+        Http::checkIngrityHttpClient();
+        #endif
+    }
+    #ifdef DEBUGFASTCGI
+    if(backend!=nullptr && backend->http!=this)
+    {
+        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << ": backend->http!=this, backend: " << backend << " backend of this http should have this http as parent (abort)" << std::endl;
         abort();
     }
     std::cerr << this << " " << __FILE__ << ":" << __LINE__ << ": backend=nullptr" << std::endl;
@@ -1966,8 +2324,8 @@ void Http::disconnectBackend(const bool fromDestructor)
         for(const Backend * b : list->busy)
             if(b->http==this)
             {
-                std::cerr << this << ": backend->http==this, backend http: " << backend << " " << getUrl() << " (abort)" << std::endl;
-                //abort();//why this is an error?
+                std::cerr << this << ": b backend->http==this, http backend: " << backend << " b backend: " << b << " backend->http: " << backend->http << " " << getUrl() << " (abort)" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                abort();
             }
     }
     for( const auto& n : Backend::addressToHttps )
@@ -1976,8 +2334,8 @@ void Http::disconnectBackend(const bool fromDestructor)
         for(const Backend * b : list->busy)
             if(b->http==this)
             {
-                std::cerr << this << ": backend->http==this, backend https: " << backend << " " << getUrl() << " (abort)" << std::endl;
-                //abort();//why this is an error?
+                std::cerr << this << ": b backend->http==this, https backend: " << backend << " b backend: " << b << " backend->http: " << backend->http << " " << getUrl() << " (abort)" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                abort();
             }
     }
     #endif
@@ -2012,15 +2370,23 @@ void Http::disconnectBackend(const bool fromDestructor)
         if(!fromDestructor)
         {
             #ifdef DEBUGFASTCGI
-            if(Http::toDebug.find(this)==Http::toDebug.cend())
+            if(Http::httpToDebug.find(this)==Http::httpToDebug.cend())
             {
-                std::cerr << this << " Http::toDelete.insert() failed because not into debug" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << this << " Http::httpToDelete.insert() failed because not into debug" << " status: " << (int)status << " " << __FILE__ << ":" << __LINE__ << std::endl;
                 abort();
             }
             else
-                std::cerr << this << " Http::toDelete.insert() ok" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << this << " Http::httpToDelete.insert() ok (backend)" << " status: " << (int)status << " " << __FILE__ << ":" << __LINE__ << std::endl;
             #endif
-            Http::toDelete.insert(this);
+            Http::httpToDelete.insert(this);
+            #ifdef DEBUGDNS
+            //very heavy check
+            if(Dns::dns->queryHaveThisClient(this))
+            {
+                std::cerr << "Http::disconnectBackend(): remain http " << this << " on dns " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
+                abort();
+            }
+            #endif
             #ifdef DEBUGFASTCGI
             for(const Client * client : Client::clients)
             {
@@ -2036,24 +2402,24 @@ void Http::disconnectBackend(const bool fromDestructor)
                 {
                     if(m->http==this)
                     {
-                        std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << std::endl;
-                        abort();
+                        std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                        //abort();
                     }
                 }
                 for( const auto &m : n.second->idle )
                 {
                     if(m->http==this)
                     {
-                        std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << std::endl;
-                        abort();
+                        std::cerr << (void *)m << " p->http==" << this << " into idle list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                        //abort();
                     }
                 }
                 for( const auto &m : n.second->pending )
                 {
                     if(m==this)
                     {
-                        std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << std::endl;
-                        abort();
+                        std::cerr << (void *)m << " p->http==" << this << " into pending list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                        //abort();
                     }
                 }
             }
@@ -2063,24 +2429,24 @@ void Http::disconnectBackend(const bool fromDestructor)
                 {
                     if(m->http==this)
                     {
-                        std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << std::endl;
-                        abort();
+                        std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                        //abort();
                     }
                 }
                 for( const auto &m : n.second->idle )
                 {
                     if(m->http==this)
                     {
-                        std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << std::endl;
-                        abort();
+                        std::cerr << (void *)m << " p->http==" << this << " into idle list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                        //abort();
                     }
                 }
                 for( const auto &m : n.second->pending )
                 {
                     if(m==this)
                     {
-                        std::cerr << (void *)m << " p->http==" << this << " into busy list, error http (abort)" << std::endl;
-                        abort();
+                        std::cerr << (void *)m << " p->http==" << this << " into pending list, error http (abort)" << ": " << __FILE__ << ":" << __LINE__ << std::endl;
+                        //abort();
                     }
                 }
             }
@@ -2112,7 +2478,7 @@ void Http::disconnectBackend(const bool fromDestructor)
         else
             std::cerr << this << " disconnectFrontend cachePath not found: " << cachePath << " " << __FILE__ << ":" << __LINE__ << std::endl;
         #endif
-        std::string cachePathTmp=cachePath+".tmp";
+        std::string cachePathTmp=tempPath;
         if(pathToHttp.find(cachePathTmp)!=pathToHttp.cend())
         {
             #ifdef DEBUGFASTCGI
@@ -2260,7 +2626,7 @@ void Http::addClient(Client * client)
             #ifdef DEBUGFASTCGI
             std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " tempCache!=nullptr !getFileMoved() cachePath: " << cachePath << std::endl;
             #endif
-            client->startRead(cachePath+".tmp",!getEndDetected());
+            client->startRead(tempPath,!getEndDetected());
         }
     }
     else
@@ -2280,6 +2646,9 @@ void Http::addClient(Client * client)
 
 bool Http::removeClient(Client * client)
 {
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
     #ifdef DEBUGFASTCGI
     std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " remove client: " << client << " cachePath: " << cachePath << std::endl;
     #endif
@@ -2309,6 +2678,9 @@ bool Http::removeClient(Client * client)
     #ifdef DEBUGFASTCGI
     std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " remove client: " << client << " cachePath: " << cachePath << std::endl;
     #endif
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
     //some drop performance at exchange of bug prevent
     size_t i=0;
     size_t itemDropped=0;
@@ -2323,6 +2695,34 @@ bool Http::removeClient(Client * client)
         }
         else
             i++;
+    }
+    if(clientsList.empty() && backend==nullptr && backendList!=nullptr)
+    {
+        unsigned int index=0;
+        while(index<backendList->pending.size())
+        {
+            if(backendList->pending.at(index)==this)
+            {
+                backendList->pending.erase(backendList->pending.cbegin()+index);
+                //break;for security
+            }
+            index++;
+        }
+        backendList=nullptr;
+    }
+    if(status==Status_WaitDns)
+    {
+        #ifdef DEBUGFASTCGI
+        std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
+        #endif
+        Dns::dns->cancelClient(this,host,isHttps(),true);
+        #ifdef DEBUGFASTCGI
+        std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << " host: " << host << std::endl;
+        #endif
+        status=Status_Idle;
+        #ifdef DEBUGFASTCGI
+        Http::checkIngrityHttpClient();
+        #endif
     }
     #ifdef DEBUGFASTCGI
     std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " remove client: " << client << " cachePath: " << cachePath << " clientsList size: " << clientsList.size();
@@ -2355,18 +2755,18 @@ bool Http::removeClient(Client * client)
         #ifdef DEBUGFASTCGI
         if(tempCache!=nullptr)
         {
-            if(pathToHttp.find(cachePath+".tmp")==pathToHttp.cend())
+            if(pathToHttp.find(tempPath)==pathToHttp.cend())
             {
-                std::cerr << "Http::removeClient(), but pathToHttp.find(" << cachePath+".tmp" << ") not found (abort) " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << "Http::removeClient(), but pathToHttp.find(" << tempPath << ") not found (abort) " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
                 //abort(); have low chance to pass here
             }
-            else if(pathToHttp.at(cachePath+".tmp")!=this)
+            else if(pathToHttp.at(tempPath)!=this)
             {
-                std::cerr << "Http::removeClient(), but pathToHttp.find(" << cachePath+".tmp" << ")!=this (abort) " << this << std::endl;
+                std::cerr << "Http::removeClient(), but pathToHttp.find(" << tempPath << ")!=this (abort) " << this << std::endl;
                 //abort();
             }
             else
-                std::cerr << "Http::removeClient(), erase pathToHttp.find(" << cachePath+".tmp" << ") " << this << std::endl;
+                std::cerr << "Http::removeClient(), erase pathToHttp.find(" << tempPath << ") " << this << std::endl;
         }
         if(finalCache!=nullptr)
         {
@@ -2398,27 +2798,57 @@ bool Http::removeClient(Client * client)
         {
             #ifdef DEBUGFASTCGI
             if(&pathToHttp==&Http::pathToHttp)
-                std::cerr << "pathToHttp.erase(" << cachePath+".tmp" << ") " << this << std::endl;
+                std::cerr << "pathToHttp.erase(" << tempPath << ") " << this << std::endl;
             if(&pathToHttp==&Https::pathToHttps)
-                std::cerr << "pathToHttps.erase(" << cachePath+".tmp" << ") " << this << std::endl;
+                std::cerr << "pathToHttps.erase(" << tempPath << ") " << this << std::endl;
             #endif
-            pathToHttp.erase(cachePath+".tmp");
+            pathToHttp.erase(tempPath);
         }
 
-
+        #ifdef DEBUGFASTCGI
+        checkBackend();
+        #endif
         disconnectFrontend(true);
+        #ifdef DEBUGFASTCGI
+        checkBackend();
+        #endif
         if(backend==nullptr)//after disconnectFrontend(), only can be !isAlive()
         {
             #ifdef DEBUGFASTCGI
-            if(Http::toDebug.find(this)==Http::toDebug.cend())
+            if(Http::httpToDebug.find(this)==Http::httpToDebug.cend())
             {
-                std::cerr << this << " Http::toDelete.insert() failed because not into debug" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << this << " Http::httpToDelete.insert() failed because not into debug, backendlist: " << backendList << " status: " << (int)status << " " << __FILE__ << ":" << __LINE__ << std::endl;
                 abort();
             }
             else
-                std::cerr << this << " Http::toDelete.insert() ok" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << this << " Http::httpToDelete.insert() ok (remove client), backendlist: " << backendList << " status: " << (int)status << " " << __FILE__ << ":" << __LINE__ << std::endl;
             #endif
-            Http::toDelete.insert(this);
+            if(backendList!=nullptr)
+            {
+                #ifdef DEBUGFASTCGI
+                std::cerr << this << " !isWithClient() backendList!=nullptr backendlist: " << backendList << " then is in pendding, remove from pendding " << __FILE__ << ":" << __LINE__ << std::endl;
+                #endif
+                unsigned int index=0;
+                while(index<backendList->pending.size())
+                {
+                    if(backendList->pending.at(index)==this)
+                    {
+                        backendList->pending.erase(backendList->pending.cbegin()+index);
+                        //break;-> full scan to prevent error
+                    }
+                    index++;
+                }
+                backendList=nullptr;
+            }
+            Http::httpToDelete.insert(this);
+            #ifdef DEBUGDNS
+            //very heavy check
+            if(Dns::dns->queryHaveThisClient(this))
+            {
+                std::cerr << "Http::disconnectBackend(): remain http " << this << " on dns " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
+                abort();
+            }
+            #endif
         }
         else
         {
@@ -2428,9 +2858,15 @@ bool Http::removeClient(Client * client)
             #endif
         }
     }
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
 
     if(!isAlive() && getEndDetected() && !isWithClient())
         flushRead();
+    #ifdef DEBUGFASTCGI
+    checkBackend();
+    #endif
 
     return retVal;
 
@@ -2441,7 +2877,7 @@ bool Http::removeClient(Client * client)
         clientsList.erase(p);*/
 }
 
-int Http::write(const char * const data,const size_t &size)
+int Http::writeToCache(const char * const data,const size_t &size)
 {
     if(endDetected)
         return -1;
@@ -2466,8 +2902,10 @@ int Http::write(const char * const data,const size_t &size)
             tempCache->close();
             delete tempCache;
             tempCache=nullptr;
-            backendError("Cache file write error");
-            disconnectBackend();
+            backendErrorAndDisconnect("Cache file write error");
+            #ifdef DEBUGFASTCGI
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+            #endif
         }
         #endif
 
@@ -2478,12 +2916,14 @@ int Http::write(const char * const data,const size_t &size)
             tempCache->close();
             delete tempCache;
             tempCache=nullptr;
-            backendError("Cache file write error");
-            disconnectBackend();
+            backendErrorAndDisconnect("Cache file write error");
+            #ifdef DEBUGFASTCGI
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+            #endif
         }
         contentwritten+=size;
         #ifdef DEBUGFASTCGI
-        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " contentsize: " << contentsize << ", contentwritten: " << contentwritten << std::endl;
+        //std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " contentsize: " << contentsize << ", contentwritten: " << contentwritten << std::endl;
         #endif
         if(contentsize<=contentwritten)
         {
@@ -2501,6 +2941,9 @@ int Http::write(const char * const data,const size_t &size)
                 client->tryResumeReadAfterEndOfFile();
 
             disconnectFrontend(false);
+            #ifdef DEBUGFASTCGI
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+            #endif
             disconnectBackend();
             return size;
         }
@@ -2551,8 +2994,10 @@ int Http::write(const char * const data,const size_t &size)
                                 tempCache->close();
                                 delete tempCache;
                                 tempCache=nullptr;
-                                backendError("Cache file write error");
-                                disconnectBackend();
+                                backendErrorAndDisconnect("Cache file write error");
+                                #ifdef DEBUGFASTCGI
+                                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                #endif
                             }
                             #endif
 
@@ -2590,8 +3035,10 @@ int Http::write(const char * const data,const size_t &size)
                                 tempCache->close();
                                 delete tempCache;
                                 tempCache=nullptr;
-                                backendError("Cache file write error");
-                                disconnectBackend();
+                                backendErrorAndDisconnect("Cache file write error");
+                                #ifdef DEBUGFASTCGI
+                                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                #endif
                             }
                             #endif
 
@@ -2737,6 +3184,9 @@ int Http::write(const char * const data,const size_t &size)
                         #endif
 
                         disconnectFrontend(false);
+                        #ifdef DEBUGFASTCGI
+                        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                        #endif
                         disconnectBackend();
                         /*if(c=='\r')
                         {
@@ -2804,8 +3254,36 @@ void Http::checkBackend()
     {
         if(backend==nullptr)//no backend, should be into pending, check if into pending list?
         {
-            if(isAlive())
+            //check if not busy/idle
+            if(!backendList->idle.empty())
             {
+                unsigned int index=0;
+                while(index<backendList->idle.size())
+                {
+                    if(backendList->idle.at(index)==backend)
+                    {
+                        std::cerr << this << " located into backendList->idle, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
+                        abort();
+                    }
+                    index++;
+                }
+            }
+            if(!backendList->busy.empty())
+            {
+                unsigned int index=0;
+                while(index<backendList->busy.size())
+                {
+                    if(backendList->busy.at(index)==backend)
+                    {
+                        std::cerr << this << " located into backendList->busy, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << " time: " << Common::msFrom1970() << " (abort)" << std::endl;
+                        abort();
+                    }
+                    index++;
+                }
+            }
+            if(isAlive() && haveUrlAndFrontendConnected())
+            {
+                //check if pending
                 unsigned int index=0;
                 while(index<backendList->pending.size())
                 {
@@ -2813,13 +3291,34 @@ void Http::checkBackend()
                         break;
                     index++;
                 }
-                if(index>=backendList->pending.size())
+            }
+            else
+            {
+                //check if pending
+                unsigned int index=0;
+                while(index<backendList->pending.size())
                 {
-                    std::cerr << this << " backend==nullptr and this " << this << " not found into pending, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " (abort) " << __FILE__ << ":" << __LINE__ << std::endl;
-                    abort();
+                    if(backendList->pending.at(index)==this)
+                    {
+                        std::cerr << this << " backend==nullptr and this " << this << " found into pending, isAlive(): " << std::to_string((int)isAlive()) << " haveUrlAndFrontendConnected(): " << std::to_string((int)haveUrlAndFrontendConnected()) << ", clientsList size: " << std::to_string(clientsList.size()) << " host: " << host << " uri: " << uri << " (abort) " << __FILE__ << ":" << __LINE__ << std::endl;
+                        abort();
+                    }
+                    index++;
                 }
             }
             return;
+        }
+
+        //here backend!=nullptr
+        unsigned int index=0;
+        while(index<backendList->pending.size())
+        {
+            if(backendList->pending.at(index)==this)
+            {
+                std::cerr << this << " found into backendList->pending but backend!=nullptr, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                abort();
+            }
+            index++;
         }
 
         if(!backendList->idle.empty())
@@ -2829,8 +3328,8 @@ void Http::checkBackend()
             {
                 if(backendList->idle.at(index)==backend)
                 {
-                    std::cerr << this << " located into backendList->idle, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << __FILE__ << ":" << __LINE__ << std::endl;
-                    return;
+                    std::cerr << this << " located into backendList->idle, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
                 }
                 index++;
             }
@@ -2844,22 +3343,14 @@ void Http::checkBackend()
             {
                 if(backendList->busy.at(index)==backend)
                 {
-                    std::cerr << this << " located into backendList->busy, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << __FILE__ << ":" << __LINE__ << std::endl;
+                    std::cerr << this << " located into backendList->busy, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << " time: " << Common::msFrom1970() << std::endl;
                     return;
                 }
                 index++;
             }
         }
-        unsigned int index=0;
-        while(index<backendList->pending.size())
-        {
-            if(backendList->pending.at(index)==this)
-            {
-                std::cerr << this << " found into backendList->pending but backend!=nullptr, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << __FILE__ << ":" << __LINE__ << std::endl;
-                abort();
-            }
-            index++;
-        }
+        std::cerr << this << " not found anywhere but backendList: " << backendList << " and backend: " << backend << ", isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        abort();
     }
     else
     {
@@ -2889,6 +3380,122 @@ void Http::checkBackend()
                 //abort();
             }
         }
+
+        for( const auto &n : Backend::addressToHttp )
+        {
+            for( Backend * p : n.second->busy )
+            {
+                if(p->http==this)
+                {
+                    std::cerr << this << " p->http==this busy, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+            for( Backend * p : n.second->idle )
+            {
+                if(p->http==this)
+                {
+                    std::cerr << this << " p->http==this idle, isAlive(): " << std::to_string((int)isAlive()) << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+            unsigned int index=0;
+            while(index<n.second->pending.size())
+            {
+                if(n.second->pending.at(index)==this)
+                {
+                    std::cerr << this << " found into BackendList but Backend list not correctly set! " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+                index++;
+            }
+        }
+        for( const auto &n : Backend::addressToHttps )
+        {
+            for( Backend * p : n.second->busy )
+            {
+                if(p->http==this)
+                {
+                    std::cerr << this << " p->http==this busy, isAlive(): " << std::to_string((int)isAlive()) << " backend: " << p << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+            for( Backend * p : n.second->idle )
+            {
+                if(p->http==this)
+                {
+                    std::cerr << this << " p->http==this idle, isAlive(): " << std::to_string((int)isAlive()) << " backend: " << p << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+            unsigned int index=0;
+            while(index<n.second->pending.size())
+            {
+                if(n.second->pending.at(index)==this)
+                {
+                    std::cerr << this << " found into BackendList but Backend list not correctly set! " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+                index++;
+            }
+        }
+    }
+    if(Http::httpToDelete.find(this)!=Http::httpToDelete.cend())
+    {
+        for( const auto &n : Backend::addressToHttp )
+        {
+            for( Backend * p : n.second->busy )
+            {
+                if(p->http==this)
+                {
+                    std::cerr << this << " Http::httpToDelete.find(this)!=Http::httpToDelete.cend(), isAlive(): " << std::to_string((int)isAlive()) << " backend: " << p << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+            for( Backend * p : n.second->idle )
+            {
+                if(p->http==this)
+                {
+                    std::cerr << this << " Http::httpToDelete.find(this)!=Http::httpToDelete.cend(), isAlive(): " << std::to_string((int)isAlive()) << " backend: " << p << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+            for( Http * p : n.second->pending )
+            {
+                if(p==this)
+                {
+                    std::cerr << this << " Http::httpToDelete.find(this)!=Http::httpToDelete.cend(), isAlive(): " << std::to_string((int)isAlive()) << " backend: " << p << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+        }
+        for( const auto &n : Backend::addressToHttps )
+        {
+            for( Backend * p : n.second->busy )
+            {
+                if(p->http==this)
+                {
+                    std::cerr << this << " Http::httpToDelete.find(this)!=Http::httpToDelete.cend(), isAlive(): " << std::to_string((int)isAlive()) << " backend: " << p << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+            for( Backend * p : n.second->idle )
+            {
+                if(p->http==this)
+                {
+                    std::cerr << this << " Http::httpToDelete.find(this)!=Http::httpToDelete.cend(), isAlive(): " << std::to_string((int)isAlive()) << " backend: " << p << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+            for( Http * p : n.second->pending )
+            {
+                if(p==this)
+                {
+                    std::cerr << this << " Http::httpToDelete.find(this)!=Http::httpToDelete.cend(), isAlive(): " << std::to_string((int)isAlive()) << " backend: " << p << ", clientsList size: " << std::to_string(clientsList.size()) << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    abort();
+                }
+            }
+        }
     }
 }
 #endif
@@ -2896,7 +3503,16 @@ void Http::checkBackend()
 //return true if timeout
 bool Http::detectTimeout()
 {
-    const uint64_t msFrom1970=Backend::msFrom1970();
+    const uint64_t msFrom1970=Common::msFrom1970();
+    if(backend!=nullptr && status==Status_WaitTheContent && requestSended)
+    {
+        if(readyToRead())//try again read something, if read something the problem is the event
+        {
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " readyToRead() WARN had more data but read by poll not by event!" << std::endl;
+            lastReceivedBytesTimestamps=msFrom1970;
+            return false;
+        }
+    }
     unsigned int secondForTimeout=5;
     if(status==Status_WaitDns)
         //timeout * server count * try
@@ -2908,7 +3524,6 @@ bool Http::detectTimeout()
         else
             secondForTimeout=10;
     }
-
     if(lastReceivedBytesTimestamps>(msFrom1970-secondForTimeout*1000))
     {
         //prevent time drift
@@ -2930,44 +3545,78 @@ bool Http::detectTimeout()
     }
     if(endDetected && !clientsList.empty())
         return false;
-    if(backend!=nullptr)
-        std::cerr << std::to_string(msFrom1970) << "/" << std::to_string(lastReceivedBytesTimestamps) << " Http::detectTimeout() need to quit " << this << " and quit backend " << (void *)backend << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << " url: " << getUrl() << std::endl;
-    else
-        std::cerr << std::to_string(msFrom1970) << "/" << std::to_string(lastReceivedBytesTimestamps) << " Http::detectTimeout() need to quit " << this << " " << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << " url: " << getUrl() << std::endl;
     #ifdef DEBUGFASTCGI
-    const auto oldlastReceivedBytesTimestamps=lastReceivedBytesTimestamps;
+    if(!requestSended && status==Status_WaitTheContent)
+    {
+        if(backend!=nullptr)
+            std::cerr << Common::msFrom1970() << " In detect timeout if(!requestSended && status==Status_WaitTheContent) with backend " << backend << " " << this << " " << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << " url: " << getUrl() << std::endl;
+        else
+            std::cerr << Common::msFrom1970() << " In detect timeout if(!requestSended && status==Status_WaitTheContent) " << this << " " << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << " url: " << getUrl() << std::endl;
+    }
     #endif
+
+    //if no byte received into 600s (10m)
+    #ifdef DEBUGFASTCGI
+        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " timeout details: " << lastReceivedBytesTimestamps << "<(" << msFrom1970 << "-" << secondForTimeout << "*1000), pending: " << pending << " requestSended: " << requestSended << " etagBackend.empty(): " << etagBackend.empty() << std::endl;
+        if(backend!=nullptr)
+        {
+            std::cerr << " backend: " << backend << " backend download finished: " << backend->get_downloadFinishedCount() << std::endl;
+            if(backend->backendList!=nullptr)
+                std::cerr << " backend->backendList: " << backend << " backend->backendList->pending.size(): " << backend->backendList->pending.size() << std::endl;
+        }
+        std::cerr << std::endl;
+    #endif
+
+    if(backend!=nullptr && status==Status_WaitTheContent && requestSended)
+    {
+        if(readyToRead())//try again read something, if read something the problem is the event
+        {
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " readyToRead() WARN had more data but event readyToReady never getected!" << std::endl;
+            lastReceivedBytesTimestamps=msFrom1970;
+            return false;
+        }
+    }
+
+    //be sure the backend will not reuse if have timeout problem
+    //disconnectFrontend(true);
+    if(backend!=nullptr)
+    {
+        #ifdef DEBUGFASTCGI
+        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+        #endif
+        //disconnectBackend();
+        backendErrorAndDisconnect("Timeout");//then able to retry
+        //can't just connect the backend because the remaining data need to be consumed
+        //then destroy backend too
+        if(backend!=nullptr)
+        {
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " close backend " << backend << " from http " << this << std::endl;
+            backend->close();//keep the backend running, clean close
+        }
+    }
+    else // was in pending list
+    {
+        #ifdef DEBUGFASTCGI
+        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+        #endif
+        disconnectBackend();
+    }
+
+    std::cerr << std::to_string(msFrom1970) << "/" << std::to_string(lastReceivedBytesTimestamps) << " Http::detectTimeout() need to quit " << this;
+    if(backend!=nullptr)
+        std::cerr << " and quit backend " << (void *)backend << " backend download finished: " << backend->get_downloadFinishedCount();
+    else
+        std::cerr << " ";
+    std::cerr  << __FILE__ << ":" << __LINE__ << " clientsList.size(): " << clientsList.size() << " endDetected: " << endDetected << " url: " << getUrl() << " contentwritten: " << contentwritten << " retryCount: " << (int)retryCount << " status: " << (int)status << std::endl;
     lastReceivedBytesTimestamps=msFrom1970;//prevent dual Http::detectTimeout()
     if(tempCache!=nullptr)
         std::cerr << "Http::detectTimeout() tempCache: " << tempCache << " fd: " << tempCache->getFD() << " " << __FILE__ << ":" << __LINE__ << std::endl;
 
-    if(pending && requestSended && !etagBackend.empty())
-    {
-        //failback to stale cache is better than fail
-        //startReadFromCacheAfter304() -> included into HttpReturnCode() but HttpReturnCode() do error management
-        http_code=304;
-        if(!HttpReturnCode(http_code))
-        {
-            flushRead();
-            #ifdef DEBUGFASTCGI
-            std::cout << __FILE__ << ":" << __LINE__ << std::endl;
-            #endif
-        }
-        return false;
-    }
-
-    //if no byte received into 600s (10m)
-    #ifdef DEBUGFASTCGI
-    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " timeout details: " << oldlastReceivedBytesTimestamps << "<(" << msFrom1970 << "-" << secondForTimeout << "*1000), pending: " << pending << " requestSended: " << requestSended << " etagBackend.empty(): " << etagBackend.empty();
-    if(backend!=nullptr)
-    {
-        std::cerr << " backend: " << backend;
-        if(backend->backendList!=nullptr)
-            std::cerr << " backend->backendList: " << backend << " backend->backendList->pending.size(): " << backend->backendList->pending.size();
-    }
-    std::cerr << std::endl;
-    #endif
-    parseNonHttpError(Backend::NonHttpError_Timeout);
+    if(contentwritten==0)
+        backendErrorAndDisconnect("Timeout into reply header");
+    else
+        backendErrorAndDisconnect("Timeout into body waiting");
+    //parseNonHttpError(Backend::NonHttpError_Timeout);
     /*do into disconnectFrontend(true):
     for(Client * client : clientsList)
     {
@@ -2975,19 +3624,7 @@ bool Http::detectTimeout()
         client->disconnect();
     }
     clientsList.clear();*/
-    disconnectFrontend(true);
-    if(backend!=nullptr)
-    {
-        disconnectBackend();
-        //can't just connect the backend because the remaining data need to be consumed
-        //then destroy backend too
-        if(backend!=nullptr)
-            backend->close();//keep the backend running, clean close
-    }
-    else // was in pending list
-    {
-        disconnectBackend();
-    }
+
     return true;
 }
 

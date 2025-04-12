@@ -1,5 +1,6 @@
 #include "CleanOldCache.hpp"
 #include "../Backend.hpp"
+#include "Common.hpp"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -16,7 +17,7 @@ CleanOldCache::CleanOldCache() :
 void CleanOldCache::exec()
 {
     #ifndef CURL
-    const uint64_t &currentTime=Backend::msFrom1970()/1000;
+    const uint64_t &currentTime=Common::msFrom1970()/1000;
     //check each 1h
     if((lastCleanTime+3600)>currentTime)
     {

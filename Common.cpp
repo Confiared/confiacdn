@@ -1,4 +1,5 @@
 #include "Common.hpp"
+#include <sys/time.h>
 
 static const char* const lut = "0123456789ABCDEF";
 
@@ -102,4 +103,11 @@ void Common::binarytoHexaC32Bits(const char * const source, char * const destina
         destination[i*2]=lut[c >> 4];
         destination[i*2+1]=lut[c & 15];
     }
+}
+
+uint64_t Common::msFrom1970() //ms from 1970
+{
+    struct timeval te;
+    gettimeofday(&te, NULL);
+    return te.tv_sec*1000LL + te.tv_usec/1000;
 }

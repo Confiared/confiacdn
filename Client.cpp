@@ -32,15 +32,15 @@ char Client::folderVar[]="";
 #endif
 
 std::unordered_set<Client *> Client::clients;
-std::unordered_set<Client *> Client::toDelete;
+std::unordered_set<Client *> Client::clientToDelete;
 #ifdef DEBUGFASTCGI
-std::unordered_set<Client *> Client::toDebug;
+std::unordered_set<Client *> Client::clientToDebug;
 #endif
 char Client::bigStaticReadBuffer[65536];
 
 Client::Client(int cfd) :
     EpollObject(cfd,EpollObject::Kind::Kind_Client),
-    fastcgiid(-1),
+    fastcgi_id(-1),
     readCache(nullptr),
     http(nullptr),
     fullyParsed(false),
@@ -52,6 +52,7 @@ Client::Client(int cfd) :
     partialEndOfFileTrigged(false),
     outputWrited(false),
     creationTime(0),
+    creationTimeOrUpdate(0),
     bodyAndHeaderFileBytesSended(0)
 {
     memset(Client::pathVar,0,sizeof(Client::pathVar));
@@ -72,21 +73,50 @@ Client::Client(int cfd) :
     #endif
     Cache::newFD(cfd,this,EpollObject::Kind::Kind_Client);
     this->kind=EpollObject::Kind::Kind_Client;
-    this->fd=cfd;
+    this->fd=cfd;//should be after Cache::newFD()
     #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " Client::Client() " << this << " fd: " << fd << " this->fd: " << this->fd << " constructor" << std::endl;
     #endif
     clients.insert(this);
-    creationTime=Backend::msFrom1970();
+    creationTime=Common::msFrom1970();
+    creationTimeOrUpdate=Common::msFrom1970();
     #ifdef DEBUGFASTCGI
-    toDebug.insert(this);
+    clientToDebug.insert(this);
     #endif
 }
 
 Client::~Client()
 {
     #ifdef DEBUGFASTCGI
-    toDebug.insert(this);
+    if(!uri.empty() && !endTriggered && fastcgi_id!=-1)
+    {
+        std::cerr << "Client::~Client() !uri.empty() && !endTriggered && fastcgiid!=-1: " << this << " " << host << uri;
+        std::cerr << " dataToWrite.size(): " << dataToWrite.size();
+        std::cerr << " status: " << (int)status;
+        std::cerr << " fastcgiid: " << (int)fastcgi_id;
+        std::cerr << " partial: " << partial;
+        std::cerr << " outputWrited: " << outputWrited;
+        if(readCache!=nullptr)
+            std::cerr << " readCache!=nullptr";
+        else
+            std::cerr << " readCache==nullptr";
+        if(http!=nullptr)
+            std::cerr << " http: " << http->getUrl() << " " << (int)http->get_status();
+        else
+            std::cerr << " nohttpsub";
+        if(fullyParsed)
+            std::cerr << " fullyParsed: true";
+        else
+            std::cerr << " fullyParsed: false";
+        #ifdef DEBUGFROMIP
+        if(!REMOTE_ADDR.empty())
+            std::cerr << " from " << REMOTE_ADDR;
+        #endif
+        std::cerr << std::endl;
+    }
+    #endif
+    #ifdef DEBUGFASTCGI
+    clientToDebug.erase(this);
     #endif
     if(clients.find(this)!=clients.cend())
         clients.erase(this);
@@ -117,13 +147,20 @@ Client::~Client()
         }
     }
     if(fd!=-1)
-        Cache::closeFD(fd);
+    {
+        #ifdef DEBUGFASTCGI
+        std::cerr << this << " fd close: " << fd << " destroy()" << std::endl;
+        #endif
+        epoll_ctl(epollfd,EPOLL_CTL_DEL, fd, NULL);
+        ::close(fd);
+        fd=-1;
+    }
 }
 
 void Client::parseEvent(const epoll_event &event)
 {
     #ifdef DEBUGFASTCGI
-    std::cout << this << " Client event.events: " << event.events << std::endl;
+    std::cout << this << " Client event.events: " << event.events << " time: " << Common::msFrom1970() << std::endl;
     #endif
     if(event.events & EPOLLIN)
     {
@@ -183,7 +220,7 @@ void Client::disconnect()
         if(fstat(fd,&sb)!=0)
             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " size: " << sb.st_size << std::endl;
         else
-            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Client::disconnect() but fd: " << fd << " errno: " << errno << std::endl;
     }
     #endif
     #ifdef DEBUGFILEOPEN
@@ -195,13 +232,18 @@ void Client::disconnect()
     if(fd!=-1)
     {
         #ifdef DEBUGFASTCGI
-        std::cerr << this << " fd: " << fd << " disconnect() close()" << std::endl;
+        std::cerr << this << " fd close: " << fd << " disconnect()" << std::endl;
         #endif
-        Cache::closeFD(fd);
         epoll_ctl(epollfd,EPOLL_CTL_DEL, fd, NULL);
-        if(::close(fd)!=0)
+        if(::close(fd)!=0)//why doble?
             std::cerr << this << " " << fd << " disconnect() failed: " << errno << std::endl;
         fd=-1;
+    }
+    if(readCache!=nullptr)
+    {
+        readCache->close();
+        delete readCache;
+        readCache=nullptr;
     }
     #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " " << "Client::disconnect(), bytesSended: " << bytesSended << " " << this << std::endl;
@@ -211,7 +253,6 @@ void Client::disconnect()
     std::cerr << __FILE__ << ":" << __LINE__ << " " << "Client::disconnect(), bytesSended: " << bytesSended << " " << this << std::endl;
     #endif
     dataToWrite.clear();
-    fastcgiid=-1;
     #ifdef DEBUGFASTCGI
     std::cerr << "disconnectFrontend client " << this << ": " << __FILE__ << ":" << __LINE__ << std::endl;
     #endif
@@ -297,7 +338,7 @@ void Client::readyToRead()
             requestRawData=std::string(Client::bigStaticReadBuffer,size);
             return;
         }
-        if(fastcgiid==-1)
+        if(fastcgi_id==-1)
         {
             if(var8!=1)
             {
@@ -313,9 +354,9 @@ void Client::readyToRead()
                 requestRawData=std::string(Client::bigStaticReadBuffer,size);
                 return;
             }
-            fastcgiid=var16;
+            fastcgi_id=var16;
             #ifndef ONFLYENCODEFASTCGI
-            if(fastcgiid!=1)
+            if(fastcgi_id!=1)
             {
                 std::cerr << __FILE__ << ":" << __LINE__ << " FastCGI protocol error, only request with id 1 is supported, use nginx + fastcgi_keep_conn off" << std::endl;
                 disconnect();
@@ -332,7 +373,7 @@ void Client::readyToRead()
             if(var8!=1 && var8!=4 && var8!=5)
             {
                 #ifdef DEBUGFASTCGI
-                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " at 2nd number read, pos: "  << std::to_string(pos) << " var8: " << std::to_string(var8) << " fastcgiid: " << std::to_string(fastcgiid) << std::endl;
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " at 2nd number read, pos: "  << std::to_string(pos) << " var8: " << std::to_string(var8) << " fastcgi_id: " << std::to_string(fastcgi_id) << std::endl;
                 #endif
                 disconnect();
                 return;
@@ -342,7 +383,7 @@ void Client::readyToRead()
                 requestRawData=std::string(Client::bigStaticReadBuffer,size);
                 return;
             }
-            if(fastcgiid!=var16)
+            if(fastcgi_id!=var16)
             {
                 #ifdef DEBUGFASTCGI
                 std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
@@ -449,10 +490,15 @@ void Client::readyToRead()
                     case 11:
                     if(memcmp(Client::bigStaticReadBuffer+pos,"REQUEST_URI",varSize)==0)
                         uri=std::string(Client::bigStaticReadBuffer+pos+varSize,valSize);
-                    #ifdef DEBUGFASTCGI
+                    #if defined(DEBUGFASTCGI) || defined(DEBUGFROMIP)
                     else if(memcmp(Client::bigStaticReadBuffer+pos,"REMOTE_ADDR",varSize)==0)
                     {
-                        std::cout << "request from IP: " << std::string(Client::bigStaticReadBuffer+pos+varSize,valSize) << std::endl;
+                        #ifdef DEBUGFROMIP
+                        REMOTE_ADDR=std::string(Client::bigStaticReadBuffer+pos+varSize,valSize);
+                        #endif
+                        #ifdef DEBUGFASTCGI
+                        std::cout << __FILE__ << ":" << __LINE__ << " " << this << " request from IP: " << std::string(Client::bigStaticReadBuffer+pos+varSize,valSize) << std::endl;
+                        #endif
                     /* black list: self ip, block ip continuously downloading same thing
                         ifNoneMatch=std::string(buff+pos+varSize,8);
                         */
@@ -476,7 +522,7 @@ void Client::readyToRead()
                             #ifdef DEBUGFASTCGI
                             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << "Anti loop protection" << std::endl;
                             #endif
-                            writeOutput(text,sizeof(text)-1);
+                            addHeaderAndWrite(text,sizeof(text)-1);
                             internalWriteEnd();
                             disconnect();
                             return;
@@ -587,7 +633,7 @@ void Client::readyToRead()
                     {
                         //std::cerr << "uri '/' not found " << uri << ", host: " << host << std::endl;
                         char text[]="X-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nCDN bad usage (1): contact@confiared.com";
-                        writeOutput(text,sizeof(text)-1);
+                        addHeaderAndWrite(text,sizeof(text)-1);
                         #ifdef DEBUGFASTCGI
                         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " bad CDN usage, data: " << Common::binarytoHexa(Client::bigStaticReadBuffer,size) << std::endl;
                         #endif
@@ -627,7 +673,7 @@ void Client::readyToRead()
                             #ifdef DEBUGFASTCGI
                             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " bad CDN usage 2, data: " << Common::binarytoHexa(Client::bigStaticReadBuffer,size) << std::endl;
                             #endif
-                            writeOutput(text,sizeof(text)-1);
+                            addHeaderAndWrite(text,sizeof(text)-1);
                             internalWriteEnd();
                             disconnect();
                             return;
@@ -660,7 +706,7 @@ void Client::readyToRead()
                 #ifdef DEBUGFASTCGI
                 std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " bad CDN usage 3, data: " << Common::binarytoHexa(Client::bigStaticReadBuffer,size) << std::endl;
                 #endif
-                writeOutput(text.c_str(),text.size());
+                addHeaderAndWrite(text.c_str(),text.size());
                 internalWriteEnd();
                 disconnect();
                 return;
@@ -679,7 +725,7 @@ void Client::readyToRead()
     if(uri=="/robots.txt")
     {
         char text[]="X-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nUser-agent: *\r\nDisallow: /";
-        writeOutput(text,sizeof(text)-1);
+        addHeaderAndWrite(text,sizeof(text)-1);
         internalWriteEnd();
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " bad CDN usage /" << std::endl;
@@ -691,7 +737,7 @@ void Client::readyToRead()
     if(uri=="/favicon.ico")
     {
         char text[]="X-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nDropped for now";
-        writeOutput(text,sizeof(text)-1);
+        addHeaderAndWrite(text,sizeof(text)-1);
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " bad CDN usage favico" << std::endl;
         #endif
@@ -730,9 +776,9 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
     #ifdef DEBUGFASTCGI
     const auto p1 = std::chrono::system_clock::now();
     if(https)
-        std::cout << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << " downloading: https://" << host << uri << std::endl;
+        std::cout << this << " " << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << " downloading: https://" << host << uri << std::endl;
     else
-        std::cout << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << " downloading: http://" << host << uri << std::endl;
+        std::cout << this << " " << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << " downloading: http://" << host << uri << std::endl;
     #endif
 
     #ifdef DEBUGFASTCGI
@@ -745,7 +791,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN bad usage host emtpy" << std::endl;
         #endif
-        writeOutput(text,sizeof(text)-1);
+        addHeaderAndWrite(text,sizeof(text)-1);
         internalWriteEnd();
         disconnect();
         return;
@@ -756,7 +802,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
         #endif
         std::string reply("X-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\n");
         reply+="Current time: ";
-        reply+=std::to_string(Backend::msFrom1970());
+        reply+=std::to_string(Common::msFrom1970());
         reply+="\r\n";
         reply+="Dns ("+std::to_string(Dns::dns->get_httpInProgress())+"): ";
         reply+=Dns::dns->getQueryList();
@@ -778,13 +824,13 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
         #ifdef DEBUGFASTCGI
         for (const Client * c : Client::clients)
             reply+=c->getStatus()+"\r\n";
-        reply+="Backend: "+std::to_string(Backend::toDebug.size())+"\r\n";
+        reply+="Backend: "+std::to_string(Backend::backendToDebug.size())+"\r\n";
         #endif
         reply+="Http: ";
         #ifdef DEBUGFASTCGI
-        reply+="(http "+std::to_string(Http::toDebug.size()-Https::toDebug.size())+" and https "+std::to_string(Https::toDebug.size())+" backend)";
+        reply+="(http "+std::to_string(Http::httpToDebug.size()-Https::toDebug.size())+" and https "+std::to_string(Https::toDebug.size())+" backend)";
         std::unordered_set<const Http *> notIntoTheList;
-        notIntoTheList.insert(Http::toDebug.begin(),Http::toDebug.end());
+        notIntoTheList.insert(Http::httpToDebug.begin(),Http::httpToDebug.end());
         #endif
         reply+="\r\n";
         {
@@ -907,7 +953,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
         for (const Http * const x: notIntoTheList)
             reply+="lost http(s) "+x->getQuery()+"\r\n";
         #endif
-        writeOutput(reply.data(),reply.size());
+        addHeaderAndWrite(reply.data(),reply.size());
     #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN end of stats" << std::endl;
     #endif
@@ -1109,7 +1155,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
                     {
                         //frontend 304
                         char text[]="Status: 304 Not Modified\r\n\r\n";
-                        writeOutput(text,sizeof(text)-1);
+                        addHeaderAndWrite(text,sizeof(text)-1);
                         #ifdef DEBUGFASTCGI
                         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN 304" << std::endl;
                         #endif
@@ -1278,7 +1324,7 @@ std::string Client::getStatus() const
         s+="Status_???";
         break;
     }
-    s+=" "+std::to_string(fastcgiid);
+    s+=" "+std::to_string(fastcgi_id);
     s+=" "+std::to_string(fd);
     if(fullyParsed)
         s+=" fullyParsed";
@@ -1520,7 +1566,7 @@ void Client::createHttpBackend()
                             #ifdef DEBUGFASTCGI
                             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN internal error etag 0" << std::endl;
                             #endif
-                            writeOutput(text,sizeof(text)-1);
+                            addHeaderAndWrite(text,sizeof(text)-1);
                             internalWriteEnd();
                             disconnect();
                             return;
@@ -1563,7 +1609,7 @@ void Client::createHttpBackendInternal(int cachefd, std::string etag)
         if(https->tryConnect(host,uri,gzip,etag))
         {
             #ifdef DEBUGFASTCGI
-            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Client::createHttpBackendInternal() have successful connect" << std::endl;
             #endif
         }
         else
@@ -1574,7 +1620,7 @@ void Client::createHttpBackendInternal(int cachefd, std::string etag)
             //Http::dnsError()
             return;
         }
-        if(http==nullptr || fastcgiid==-1 || fd==-1)//then tryConnect() have disconnected it, eg: cached Http::dnsError()
+        if(http==nullptr || fastcgi_id==-1 || fd==-1)//then tryConnect() have disconnected it, eg: cached Http::dnsError()
             return;
         if(Https::pathToHttps.find(pathForIndex)==Https::pathToHttps.cend())
         {
@@ -1623,7 +1669,7 @@ void Client::createHttpBackendInternal(int cachefd, std::string etag)
             //Http::dnsError()
             return;
         }
-        if(http==nullptr || fastcgiid==-1 || fd==-1)//then tryConnect() have disconnected it, eg: cached Http::dnsError()
+        if(http==nullptr || fastcgi_id==-1 || fd==-1)//then tryConnect() have disconnected it, eg: cached Http::dnsError()
             return;
         if(Http::pathToHttp.find(pathForIndex)==Http::pathToHttp.cend())
         {
@@ -1646,6 +1692,8 @@ void Client::createHttpBackendInternal(int cachefd, std::string etag)
 
 bool Client::startRead()
 {
+    if(readCache==nullptr)
+        return false;
     #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " Client::startRead()" << std::endl;
     #endif
@@ -1654,7 +1702,7 @@ bool Client::startRead()
         std::cerr << __FILE__ << ":" << __LINE__ << " Client::startRead(): !readCache->seekToContentPos(), cache corrupted?" << std::endl;
         status=Status_Idle;
         char text[]="Status: 500 Internal Server Error\r\nX-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nUnable to read cache (1)";
-        writeOutput(text,sizeof(text)-1);
+        addHeaderAndWrite(text,sizeof(text)-1);
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN unable to read cache" << std::endl;
         #endif
@@ -1701,9 +1749,10 @@ bool Client::startRead(const std::string &path, const bool &partial)
     //if failed open cache
     if(cachefd==-1)
     {
-        //workaround internal bug cache PATH
-        const std::string temppath=path+".tmp";
-        int cachefd = ::open(temppath.c_str(), O_RDWR | O_NOCTTY/* | O_NONBLOCK*/, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        //workaround internal bug cache PATH, -> suspect this generated corrupted cache, blocked now by random cache name
+        /*const std::string temppath=path+".tmp";
+        int cachefd = ::open(temppath.c_str(), O_RDWR | O_NOCTTY, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        const int temperrno2=errno;*/
         const int temperrno2=errno;
         //if failed open cache
         if(cachefd==-1)
@@ -1721,7 +1770,7 @@ bool Client::startRead(const std::string &path, const bool &partial)
             #endif
             status=Status_Idle;
             char text[]="Status: 500 Internal Server Error\r\nX-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nUnable to read cache (2)";
-            writeOutput(text,sizeof(text)-1);
+            addHeaderAndWrite(text,sizeof(text)-1);
             internalWriteEnd();
             disconnect();
             return false;
@@ -1745,7 +1794,7 @@ bool Client::startRead(const std::string &path, const bool &partial)
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " unable to seek" << std::endl;
         status=Status_Idle;
         char text[]="Status: 500 Internal Server Error\r\nX-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nUnable to seek";
-        writeOutput(text,sizeof(text)-1);
+        addHeaderAndWrite(text,sizeof(text)-1);
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN unable to seek" << std::endl;
         #endif
@@ -1769,7 +1818,7 @@ bool Client::startRead(const std::string &path, const bool &partial)
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " unable to seek to content" << std::endl;
         status=Status_Idle;
         char text[]="Status: 500 Internal Server Error\r\nX-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nUnable to seek to content";
-        writeOutput(text,sizeof(text)-1);
+        addHeaderAndWrite(text,sizeof(text)-1);
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN unable to seek to content" << std::endl;
         #endif
@@ -1808,7 +1857,7 @@ void Client::writeOutputDropDataIfNeeded(const char * const data,const size_t &s
     #endif
     errno=0;
     if(fd!=-1)
-        writeOutput(data,size);
+        addHeaderAndWrite(data,size);
 }
 
 void Client::continueRead()
@@ -1845,6 +1894,13 @@ void Client::continueRead()
     #endif
     char buffer[65535-1000];//fastcgi is limited to 65535-1000 size
     do {
+        if(readCache==nullptr)
+        {
+            #ifdef DEBUGFASTCGI
+            std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " " << this << " Client::continueRead() readCache==nullptr" << std::endl;
+            #endif
+            return;
+        }
         const ssize_t &s=readCache->read(buffer,sizeof(buffer));
         #ifdef DEBUGFASTCGI
         //std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " continueRead(): " << s << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
@@ -1855,6 +1911,10 @@ void Client::continueRead()
             {
                 #ifdef DEBUGFASTCGI
                 std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " internalWriteEnd();disconnect(); and !partial" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
+                #endif
+                #ifdef ONFLYENCODEFASTCGI
+                //work around
+                outputWrited=true;
                 #endif
                 internalWriteEnd();
                 disconnect();
@@ -1930,7 +1990,14 @@ void Client::continueRead()
         else
             bodyAndHeaderFileBytesSended+=s;
         #ifdef ONFLYENCODEFASTCGI
-        writeOutput(buffer,s);
+        #ifdef DEBUGFASTCGI
+        if(!isValid())
+        {
+            std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " !isValid(): " << s << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
+            std::cerr << "search in the log: " << this << " fd close: " << std::endl;
+        }
+        #endif
+        addHeaderAndWrite(buffer,s);
         #else
         write(buffer,s);
         #endif
@@ -1941,7 +2008,7 @@ void Client::continueRead()
         if(!dataToWrite.empty())
         {
             #ifdef DEBUGFASTCGI
-            std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " client TCP buffer statured, return to wait buffer is empty" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << ", remain to write: " << dataToWrite.size() << std::endl;
+            std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " client TCP buffer statured, return to wait buffer is empty" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << ", remain to write: " << dataToWrite.size() << " time: " << Common::msFrom1970() << std::endl;
             #endif
             return;
         }
@@ -1962,7 +2029,7 @@ void Client::cacheError()
     #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " CDN cache file error" << std::endl;
     #endif
-    writeOutput(text,sizeof(text)-1);
+    addHeaderAndWrite(text,sizeof(text)-1);
     internalWriteEnd();
     disconnect();
 }
@@ -2070,7 +2137,7 @@ void Client::httpError(const std::string &errorString)
     const std::string &fullContent=
             "Status: 500 Internal Server Error\r\nX-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nError: "+
             errorString;
-    writeOutput(fullContent.data(),fullContent.size());
+    addHeaderAndWrite(fullContent.data(),fullContent.size());
     internalWriteEnd();
     disconnect();
 }
@@ -2085,17 +2152,19 @@ bool Client::detectTimeout()
     #ifdef DEBUGFASTCGI
     if(http!=nullptr)
     {
-        if(Http::toDebug.find(http)==Http::toDebug.cend())
+        if(Http::httpToDebug.find(http)==Http::httpToDebug.cend())
         {
             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << "Client::detectTimeout(), Http::toDebug.find(http)==Http::toDebug.cend()" << std::endl;
             //abort();
         }
     }
     #endif
-    if(fullyParsed)
-        return false;
-    const uint64_t msFrom1970=Backend::msFrom1970();
-    if(creationTime>(msFrom1970-5000))
+    /*init with creationTime=Common::msFrom1970();
+     * then check too if not timeout into parse
+     * if(fullyParsed)
+        return false;*/
+    const uint64_t msFrom1970=Common::msFrom1970();
+    if(creationTime>(msFrom1970-5*60*1000))
     {
         //prevent time drift
         if(creationTime>msFrom1970)
@@ -2103,8 +2172,102 @@ bool Client::detectTimeout()
             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << "Client::detectTimeout(), time drift" << std::endl;
             creationTime=msFrom1970;
         }
-        return false;
+        if(creationTimeOrUpdate>(msFrom1970-20*1000))
+        {
+            //prevent time drift
+            if(creationTimeOrUpdate>msFrom1970)
+            {
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << "Client::detectTimeout(), time drift" << std::endl;
+                creationTimeOrUpdate=msFrom1970;
+            }
+            return false;
+        }
     }
+
+
+    /* workaround bug:
+    ./Client.cpp:2261 temperrno==EAGAIN this 0x5605593c3050 size 64535 writedSize -1
+    ./Client.cpp:1960 fd: 15 this->fd: 0x5605593c3050 client TCP buffer statured, return to wait buffer is empty fileBytesSended: 9163969, remain to write: 64535
+    ./Client.cpp:182 event.events: 4 0x5605593c3050
+    */
+    if(!dataToWrite.empty())
+    {
+        const uint64_t beforeTrySize=dataToWrite.size();
+        readyToWrite();
+        if(dataToWrite.empty())
+            return false;
+        const uint64_t tempbodyAndHeaderFileBytesSended=bodyAndHeaderFileBytesSended;
+        continueRead();
+        const uint64_t &afterTrySize=dataToWrite.size();
+        if(beforeTrySize!=afterTrySize)
+        {
+            creationTimeOrUpdate=msFrom1970;
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " beforeTrySize!=afterTrySize: " << beforeTrySize << "!=" << afterTrySize << " url: " << host << uri << " msFrom1970: " << msFrom1970 << std::endl;
+            return false;
+        }
+        else
+        {
+            if(tempbodyAndHeaderFileBytesSended!=bodyAndHeaderFileBytesSended)
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " NO NEW DATA BUT HAVE SEND MORE DATA url: " << host << uri << " msFrom1970: " << msFrom1970 << std::endl;
+            else
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " NO NEW DATA url: " << host << uri << " msFrom1970: " << msFrom1970 << std::endl;
+        }
+    }
+
+    if(fullyParsed)
+    {
+        if(!dataToWrite.empty())
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Client::detectTimeout() call disconnect, remain data to write, maybe client just download the header? CURLOPT_NOBODY?";
+        else
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Client::detectTimeout() call disconnect time: " << Common::msFrom1970() << " elapsed time: " << (creationTimeOrUpdate-msFrom1970) << "ms";
+    }
+    else
+        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Client::detectTimeout() call disconnect when not fully parsed";
+    std::cerr << " creationTime: " << creationTime;
+    std::cerr << " creationTimeOrUpdate: " << creationTimeOrUpdate;
+    std::cerr << " msFrom1970: " << msFrom1970;
+    #ifdef DEBUGFASTCGI
+    std::cerr << " bytesSended: " << bytesSended;
+    #endif
+    #ifdef DEBUGFROMIP
+    if(!REMOTE_ADDR.empty())
+        std::cerr << " IP: " << REMOTE_ADDR;
+    #endif
+    if(!uri.empty())
+        std::cerr << " uri: " << uri;
+    if(!host.empty())
+        std::cerr << " host: " << host;
+
+    std::cerr << " dataToWrite.size(): " << dataToWrite.size();
+    std::cerr << " status: " << (int)status;
+    std::cerr << " fastcgiid: " << (int)fastcgi_id;
+    if(readCache!=nullptr)
+        std::cerr << " readCache!=nullptr";
+    else
+        std::cerr << " readCache==nullptr";
+    if(http!=nullptr)
+    {
+        std::cerr << " http: " << http->getUrl() << " " << (int)http->get_status();
+        if(http->backendList!=nullptr)
+        {
+            std::cerr << " backendList: " << http->backendList;
+            std::cerr << " busy: " << http->backendList->busy.size();
+            std::cerr << " idle: " << http->backendList->idle.size();
+            std::cerr << " pendding: " << http->backendList->pending.size();
+        }
+    }
+    else
+        std::cerr << " nohttpsub";
+    if(fullyParsed)
+        std::cerr << " fullyParsed: true";
+    else
+        std::cerr << " fullyParsed: false";
+    if(endTriggered)
+        std::cerr << " endTriggered: true";
+    else
+        std::cerr << " endTriggered: false";
+
+    std::cerr << std::endl;
     disconnect();
     return true;
 }
@@ -2125,11 +2288,24 @@ void Client::write(const char * const data,const int &size)
         }
         return;
     }
+    /*Can be called without cache tempory open like httpError, readCache, ... THIS VALID NOT REFER TO FASTCGI!
     if(!isValid())
+    {
+        #ifdef DEBUGFASTCGI
+        std::cerr << " Client::writeEnd() !isValid()" << std::endl;
+        #endif
         return;
-    if(fastcgiid==-1)
-        if(fd!=-1)
-            Cache::closeFD(fd);
+    }*/
+    if(fd==-1)
+    {
+        if(readCache!=nullptr)
+        {
+            readCache->close();
+            delete readCache;
+            readCache=nullptr;
+        }
+        return;
+    }
     if(data==nullptr)
         return;
     if(!dataToWrite.empty())
@@ -2226,6 +2402,7 @@ void Client::internalWriteEnd()
 
 void Client::writeEnd(const uint64_t &fileBytesSended)
 {
+    status=Status_Idle;
     if(get_bodyAndHeaderFileBytesSended()!=(int64_t)fileBytesSended)
     {
         #ifdef DEBUGFASTCGI
@@ -2233,29 +2410,44 @@ void Client::writeEnd(const uint64_t &fileBytesSended)
         #endif
         return;
     }
+    /*Can be called without cache tempory open like httpError, readCache, ... THIS VALID NOT REFER TO FASTCGI!
     if(!isValid())
     {
         #ifdef DEBUGFASTCGI
         std::cerr << " Client::writeEnd() !isValid()" << std::endl;
         #endif
         return;
+    }*/
+    if(fd==-1)
+    {
+        if(readCache!=nullptr)
+        {
+            readCache->close();
+            delete readCache;
+            readCache=nullptr;
+        }
+        return;
     }
-    if(fastcgiid==-1)
-        if(fd!=-1)
-            Cache::closeFD(fd);
+    creationTimeOrUpdate=Common::msFrom1970();
     #ifdef DEBUGFASTCGI
     const auto p1 = std::chrono::system_clock::now();
-    std::cerr << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << " Client::writeEnd(): " << bodyAndHeaderFileBytesSended << std::endl;
+    std::cerr << __FILE__ << ":" << __LINE__ << " Client::writeEnd(): " << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << ": " << bodyAndHeaderFileBytesSended << std::endl;
     if(http!=nullptr)
         std::cerr << http->getUrl() << " ";
     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
     #endif
     disconnectFromHttp();
-    if(!outputWrited)
+    if(!outputWrited)//mean never send nothing, header/body
     {
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " !outputWrited" << std::endl;
         #endif
+        if(readCache!=nullptr)
+        {
+            readCache->close();
+            delete readCache;
+            readCache=nullptr;
+        }
         return;
     }
     if(partial && readCache!=nullptr)
@@ -2283,6 +2475,12 @@ void Client::writeEnd(const uint64_t &fileBytesSended)
                 // case Backend::detectTimeout() timeout while downloading, when partial already downloaded
                 //abort();
             }
+        if(readCache!=nullptr)
+        {
+            readCache->close();
+            delete readCache;
+            readCache=nullptr;
+        }
         return;
     }
     #ifdef DEBUGFILEOPEN
@@ -2297,7 +2495,7 @@ void Client::writeEnd(const uint64_t &fileBytesSended)
 
     write(Http::fastcgiheaderend,sizeof(Http::fastcgiheaderend));
 
-    fastcgiid=-1;
+    fastcgi_id=-1;
     if(dataToWrite.empty())
     {
         #ifdef DEBUGFASTCGI
@@ -2314,18 +2512,32 @@ void Client::writeEnd(const uint64_t &fileBytesSended)
         endTriggered=true;
 }
 
-void Client::writeOutput(const char * const data, const int &size)
+void Client::addHeaderAndWrite(const char * const data, const int &size)
 {
     if(size>65535-1000)
     {
-        std::cerr << "writeOutput() size > 65535-1000, then greater than allowed by fastcgi, see Http::buffer and Client::continueRead() (abort)" << std::endl;
+        std::cerr << "addHeaderAndWrite() size > 65535-1000, then greater than allowed by fastcgi, see Http::buffer and Client::continueRead() (abort)" << std::endl;
         abort();
     }
+    /*Can be called without cache tempory open like httpError, readCache, ... THIS VALID NOT REFER TO FASTCGI!
     if(!isValid())
+    {
+        #ifdef DEBUGFASTCGI
+        std::cerr << " Client::writeEnd() !isValid()" << std::endl;
+        #endif
         return;
-    if(fastcgiid==-1)
-        if(fd!=-1)
-            Cache::closeFD(fd);
+    }*/
+    if(fd==-1)
+    {
+        if(readCache!=nullptr)
+        {
+            readCache->close();
+            delete readCache;
+            readCache=nullptr;
+        }
+        return;
+    }
+    creationTimeOrUpdate=Common::msFrom1970();
     #ifdef DEBUGFASTCGI
     //std::cerr << this << " " << __FILE__ << ":" << __LINE__ << ", outputWrited: " << outputWrited << " content (size " << size << "): " << Common::binarytoHexa(data,size) << std::endl;
     #endif

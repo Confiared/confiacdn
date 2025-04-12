@@ -33,6 +33,7 @@ public:
     #ifdef DEBUGDNS
     //very heavy check
     bool queryHaveThisClient(Http * http,const std::string &host,const bool &https) const;
+    bool queryHaveThisClient(Http * http) const;
     #endif
     int requestCountMerged();
     void cleanCache();
