@@ -315,7 +315,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
             //answers list
             if(queryList.find(transactionId)!=queryList.cend())
             {
-                const Query &q=queryList.at(transactionId);
+                //not reference!!! in case of error have to be flush
+                const Query q=queryList.at(transactionId);
 
                 #ifdef DEBUGFASTCGI
                 Http::checkIngrityHttpClient();
@@ -432,6 +433,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
 
                                 if(entry.status==StatusEntry_Right)
                                 {
+                                    queryList[transactionId].http.clear();
+                                    queryList[transactionId].https.clear();
                                     if(!https.empty())
                                     {
                                         memcpy(&targetHttps.sin6_addr,&entry.sin6_addr,16);
@@ -449,6 +452,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                             }
                             if(cacheFound==false)
                             {
+                                queryList[transactionId].http.clear();
+                                queryList[transactionId].https.clear();
                                 for(Http * const c : http)
                                     c->dnsError();
                                 for(Http * const c : https)
@@ -482,6 +487,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                     entry.outdated_date=maxTime;
                                 if(entry.status==StatusEntry_Right)
                                 {
+                                    queryList[transactionId].http.clear();
+                                    queryList[transactionId].https.clear();
                                     if(!https.empty())
                                     {
                                         memcpy(&targetHttps.sin6_addr,&entry.sin6_addr,16);
@@ -499,6 +506,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                             }
                             if(cacheFound==false)
                             {
+                                queryList[transactionId].http.clear();
+                                queryList[transactionId].https.clear();
                                 addCacheEntryFailed(StatusEntry_Wrong,300,q.host);
                                 for(Http * const c : http)
                                     c->dnsError();
@@ -548,6 +557,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                             entry.outdated_date=maxTime;
                                         if(entry.status==StatusEntry_Right)
                                         {
+                                            queryList[transactionId].http.clear();
+                                            queryList[transactionId].https.clear();
                                             if(!https.empty())
                                             {
                                                 memcpy(&targetHttps.sin6_addr,&entry.sin6_addr,16);
@@ -565,6 +576,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                     }
                                     if(cacheFound==false)
                                     {
+                                        queryList[transactionId].http.clear();
+                                        queryList[transactionId].https.clear();
                                         addCacheEntryFailed(StatusEntry_Error,300,q.host);
                                         for(Http * const c : http)
                                             c->dnsError();
@@ -634,6 +647,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                     {
                                         if(!clientsFlushed)
                                         {
+                                            queryList[transactionId].http.clear();
+                                            queryList[transactionId].https.clear();
                                             clientsFlushed=true;
                                             addCacheEntry(StatusEntry_Wrong,ttl,q.host,*reinterpret_cast<in6_addr *>(buffer+pos));
                                             for(Http * const c : http)
@@ -661,6 +676,7 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
 
                                             if(!http.empty())
                                             {
+                                                queryList[transactionId].http.clear();
                                                 memcpy(&targetHttp.sin6_addr,buffer+pos,16);
                                                 for(Http * const c : http)
                                                 {
@@ -686,6 +702,7 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                             #endif
                                             if(!https.empty())
                                             {
+                                                queryList[transactionId].https.clear();
                                                 memcpy(&targetHttps.sin6_addr,buffer+pos,16);
                                                 for(Http * const c : https)
                                                 {
@@ -760,6 +777,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                     entry.outdated_date=maxTime;
                                 if(entry.status==StatusEntry_Right)
                                 {
+                                    queryList[transactionId].http.clear();
+                                    queryList[transactionId].https.clear();
                                     if(!https.empty())
                                     {
                                         memcpy(&targetHttps.sin6_addr,&entry.sin6_addr,16);
@@ -777,6 +796,8 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                             }
                             if(cacheFound==false)
                             {
+                                queryList[transactionId].http.clear();
+                                queryList[transactionId].https.clear();
                                 addCacheEntryFailed(StatusEntry_Error,300,q.host);
                                 for(Http * const c : http)
                                     c->dnsError();
@@ -1725,6 +1746,8 @@ void Dns::checkQueries()
                         entry.outdated_date=maxTime;
                     if(entry.status==StatusEntry_Right)
                     {
+                        queryList[id].http.clear();
+                        queryList[id].https.clear();
                         if(!https.empty())
                         {
                             memcpy(&targetHttps.sin6_addr,&entry.sin6_addr,16);
@@ -1742,7 +1765,8 @@ void Dns::checkQueries()
                 }
                 if(cacheFound==false)
                 {
-
+                    queryList[id].http.clear();
+                    queryList[id].https.clear();
                     for(Http * const c : http)
                         c->dnsError();
                     for(Http * const c : https)
@@ -1823,6 +1847,8 @@ void Dns::checkQueries()
                         entry.outdated_date=maxTime;
                     if(entry.status==StatusEntry_Right)
                     {
+                        queryList[id].http.clear();
+                        queryList[id].https.clear();
                         if(!https.empty())
                         {
                             memcpy(&targetHttps.sin6_addr,&entry.sin6_addr,16);
@@ -1840,7 +1866,8 @@ void Dns::checkQueries()
                 }
                 if(cacheFound==false)
                 {
-
+                    queryList[id].http.clear();
+                    queryList[id].https.clear();
                     for(Http * const c : http)
                         c->dnsError();
                     for(Http * const c : https)
@@ -1894,6 +1921,8 @@ void Dns::checkQueries()
                     entry.outdated_date=maxTime;
                 if(entry.status==StatusEntry_Right)
                 {
+                    queryList[queryId].http.clear();
+                    queryList[queryId].https.clear();
                     if(!https.empty())
                     {
                         memcpy(&targetHttps.sin6_addr,&entry.sin6_addr,16);
@@ -1911,7 +1940,8 @@ void Dns::checkQueries()
             }
             if(cacheFound==false)
             {
-
+                queryList[queryId].http.clear();
+                queryList[queryId].https.clear();
                 for(Http * const c : http)
                     c->dnsError();
                 for(Http * const c : https)

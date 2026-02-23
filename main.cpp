@@ -89,6 +89,9 @@ int main(int argc, char *argv[])
         else if (std::string(argv[i]) == "--help") {
                     std::cerr << "--nocache: to file on disk is only used to have temp file, removed at end of downloading" << std::endl;
                     std::cerr << "--http200Time=999: for http 200, time in seconds without recheck" << std::endl;
+                    std::cerr << "--maxdownloadtime=3600: maximum time in seconds to download file on CDN" << std::endl;
+                    std::cerr << "--maxreadtime=20: maximum time in seconds to get new data from url for the CDN" << std::endl;
+                    std::cerr << "--maxdwritetime=10: maximum time in seconds to send new data to client" << std::endl;
                     std::cerr << "--maxBackend=999: maximum backend to a single IP (connexion limit)" << std::endl;
                     std::cerr << "--forcehttpclose: force http close connection after each request" << std::endl;
                     std::cerr << "--disableCompressionForBackend: disable request http compression for backend" << std::endl;
@@ -107,6 +110,24 @@ int main(int argc, char *argv[])
                     Cache::http200Time=std::stoi(val);
                     #ifdef DEBUGFASTCGI
                     std::cout << "Now Cache::http200Time is " << Cache::http200Time << "s" << std::endl;
+                    #endif
+                }
+                else if (var=="--maxdownloadtime") {
+                    Cache::maxDownloadTimeInMS=std::stoi(val)*1000;
+                    #ifdef DEBUGFASTCGI
+                    std::cout << "Now Cache::maxDownloadTimeInMS is " << Cache::maxDownloadTimeInMS << "s" << std::endl;
+                    #endif
+                }
+                else if (var=="--maxreadtime") {
+                    Cache::maxDownloadIdleTimeREADInMS=std::stoi(val)*1000;
+                    #ifdef DEBUGFASTCGI
+                    std::cout << "Now Cache::maxDownloadIdleTimeREADInMS is " << Cache::maxDownloadIdleTimeREADInMS << "s" << std::endl;
+                    #endif
+                }
+                else if (var=="--maxdwritetime") {
+                    Cache::maxDownloadIdleTimeWRITEInMS=std::stoi(val)*1000;
+                    #ifdef DEBUGFASTCGI
+                    std::cout << "Now Cache::maxDownloadIdleTimeWRITEInMS is " << Cache::maxDownloadIdleTimeWRITEInMS << "s" << std::endl;
                     #endif
                 }
                 else if (var=="--maxBackend") { //--maxBackend=64
@@ -391,7 +412,10 @@ int main(int argc, char *argv[])
                 case EpollObject::Kind::Kind_Client:
                 {
                     #ifdef DEBUGFASTCGI
-                    std::cerr << "Event on Client " << e.data.ptr << " e.events: " << e.events << " time: " << Common::msFrom1970() << std::endl;
+                    std::cerr << "Event on Client " << e.data.ptr << " e.events: " << e.events << " time: " << Common::msFrom1970() << " nfds: " << nfds << std::endl;
+                    std::cerr << "Event dump: " << std::endl;
+                    for (int n = 0; n < nfds; ++n)
+                        std::cerr << "Event " << events[n].events << " on " << events[n].data.ptr << std::endl;
                     #endif
                     Client * client=static_cast<Client *>(e.data.ptr);
                     client->parseEvent(e);
@@ -415,7 +439,10 @@ int main(int argc, char *argv[])
                     if(!backend->isValid())
                     {
                         #ifdef DEBUGFASTCGI
-                        std::cerr << "Event on Backend " << e.data.ptr << " e.events: " << e.events << " time: " << Common::msFrom1970() << " now delete" << std::endl;
+                        std::cerr << "Event on Backend " << e.data.ptr << " e.events: " << e.events << " time: " << Common::msFrom1970() << " nfds: " << nfds << " now delete" << std::endl;
+                        std::cerr << "Event dump: " << std::endl;
+                        for (int n = 0; n < nfds; ++n)
+                            std::cerr << "Event " << events[n].events << " on " << events[n].data.ptr << std::endl;
                         #endif
                         backend->close();
                         backend->remoteSocketClosed();

@@ -50,6 +50,9 @@ public://configured by argument, see main.cpp
     */
     static bool enable;
     static uint32_t http200Time;
+    static uint32_t maxDownloadTimeInMS;//why not in S? to don't do multiply *1000 each time
+    static uint32_t maxDownloadIdleTimeREADInMS;//why not in S? to don't do multiply *1000 each time
+    static uint32_t maxDownloadIdleTimeWRITEInMS;//why not in S? to don't do multiply *1000 each time
 
     static int cacheTimeDivider;
     void *client;

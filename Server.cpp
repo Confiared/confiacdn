@@ -29,7 +29,7 @@ Server::Server(const char *const path)
     int len = strlen(local.sun_path) + sizeof(local.sun_family);
     if(bind(fd, (struct sockaddr *)&local, len)!=0)
     {
-        std::cerr << "Can't bind the unix socket, error (errno): " << errno << std::endl;
+        std::cerr << "Can't bind the unix socket, error (errno): " << errno << " at " << path << std::endl;
         abort();
     }
 

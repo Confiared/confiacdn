@@ -1686,7 +1686,7 @@ bool Backend::socketWrite(const void *buffer, size_t size)
     std::cout << this << " " << "Try socket write: " << size << " " << __FILE__ << ":" << __LINE__ << std::endl;
     if(http==nullptr)
     {
-        std::cerr << this << " " << "socketRead() when no http set" << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        std::cerr << this << " " << "socketWrite() when no http set" << " " << __FILE__ << ":" << __LINE__ << std::endl;
         errno=0;
         return false;
     }

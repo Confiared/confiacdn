@@ -231,13 +231,51 @@ void Client::disconnect()
     #endif
     if(fd!=-1)
     {
+        if(!endTriggered)
+        {
+            time_t timestamp;
+            time(&timestamp);
+            std::cerr << this << " time " << ctime(&timestamp) << " closed before end " << bodyAndHeaderFileBytesSended << " " << host << "/" << uri << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        }
         #ifdef DEBUGFASTCGI
-        std::cerr << this << " fd close: " << fd << " disconnect()" << std::endl;
+        std::cerr << this << " fd close: " << fd << " disconnect(), dataToWrite.size(): " << dataToWrite.size() << std::endl;
         #endif
         epoll_ctl(epollfd,EPOLL_CTL_DEL, fd, NULL);
-        if(::close(fd)!=0)//why doble?
+        if(::close(fd)!=0)
             std::cerr << this << " " << fd << " disconnect() failed: " << errno << std::endl;
         fd=-1;
+    }
+    //to debug
+    if(uri.find("-setup.exe")!=std::string::npos && uri.find("ultracopier")!=std::string::npos)
+    {
+        if(bodyAndHeaderFileBytesSended<10000000)
+        {
+            time_t timestamp;
+            time(&timestamp);
+            std::cerr << this << " time " << ctime(&timestamp)
+                     #ifdef DEBUGFROMIP
+                     << " from " << REMOTE_ADDR
+                     #endif
+                      << " exe files ultracopier seam too small into disconnect() bodyAndHeaderFileBytesSended: " << bodyAndHeaderFileBytesSended << " " << host << "/" << uri << " time since start " << (Common::msFrom1970()-creationTime)/1000 << "s " << __FILE__ << ":" << __LINE__ << std::endl;
+            if(http!=nullptr)
+                std::cerr << this << " http: " << http->getQuery() << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            if(readCache!=nullptr)
+            {
+                struct stat sb;
+                if(fstat(readCache->getFD(),&sb)==0)
+                {
+                    if(sb.st_size<10000000)
+                        std::cerr << this << " exe cache ultracopier seam too small and cache FD too " << host << "/" << uri << " pathVar " << pathVar << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    else
+                        std::cerr << this << " exe cache ultracopier size seam ok: " << sb.st_size << " " << host << "/" << uri << " pathVar " << pathVar << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                }
+                else
+                    std::cerr << this << " exe cache ultracopier unable to stat errno " << errno << " " << host << "/" << uri << " pathVar " << pathVar << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            }
+            #ifdef DEBUGFASTCGI
+            std::cerr << getStatus() << std::endl;
+            #endif
+        }
     }
     if(readCache!=nullptr)
     {
@@ -260,6 +298,24 @@ void Client::disconnect()
 
 void Client::disconnectFromHttp()
 {
+    //to debug
+    if(uri.find("-setup.exe")!=std::string::npos && uri.find("ultracopier")!=std::string::npos)
+    {
+        if(bodyAndHeaderFileBytesSended<10000000)
+        {
+            std::cerr << this << " exe files ultracopier seam too small " << bodyAndHeaderFileBytesSended
+             #ifdef DEBUGFROMIP
+             << " from " << REMOTE_ADDR
+             #endif
+                      << " " << host << "/" << uri << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            if(http!=nullptr)
+                std::cerr << this << " http: " << http->getQuery() << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            #ifdef DEBUGFASTCGI
+            std::cerr << getStatus() << std::endl;
+            #endif
+        }
+    }
+
     if(http!=nullptr)
     {
         if(!http->removeClient(this))
@@ -355,13 +411,11 @@ void Client::readyToRead()
                 return;
             }
             fastcgi_id=var16;
-            #ifndef ONFLYENCODEFASTCGI
             if(fastcgi_id!=1)
             {
                 std::cerr << __FILE__ << ":" << __LINE__ << " FastCGI protocol error, only request with id 1 is supported, use nginx + fastcgi_keep_conn off" << std::endl;
                 disconnect();
             }
-            #endif
         }
         else
         {
@@ -1235,6 +1289,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
             }
             if(lastModificationTimeCheck>(currentTime-Cache::timeToCache(http_code)))
             {
+                //from cache load (too recent to check)
                 #ifdef DEBUGFASTCGI
                 std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << std::endl;
                 #endif
@@ -1267,6 +1322,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
             }
             else
             {
+                //http 304 load
                 #ifdef DEBUGFILEOPEN
                 std::cerr << "Client::loadUrl(), readCache close: " << cachefd << ", " << __FILE__ << ":" << __LINE__ << std::endl;
                 #endif
@@ -1481,6 +1537,24 @@ void Client::createHttpBackend()
         }
         else
         {
+            //to debug
+            if(uri.find("-setup.exe")!=std::string::npos && uri.find("ultracopier")!=std::string::npos)
+            {
+                struct stat sb;
+                if(fstat(cachefd,&sb)==0)
+                {
+                    if(sb.st_size<10000000)
+                    {
+                        std::cerr << this << " exe cache ultracopier seam too small " << host << "/" << uri << " pathVar " << pathVar << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                        #ifdef DEBUGFASTCGI
+                        std::cerr << getStatus() << std::endl;
+                        #endif
+                    }
+                }
+                else
+                    std::cerr << this << " exe get cache size failed errno " << errno << " ultracopier seam too small " << host << "/" << uri << " pathVar " << pathVar << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            }
+
             #ifdef DEBUGFASTCGI
             const bool cacheWasExists2=stat(pathVar,&sb)==0;
             if(!cacheWasExists)
@@ -1882,6 +1956,9 @@ void Client::continueRead()
         #endif
         return;
     }
+    /* NEVER DO THIS! generate bug
+     * if(http!=nullptr)
+        http->readyToRead();*/
     #ifdef DEBUGFASTCGI
     if(http)
         std::cerr << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count() << " " << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " http " << http << " http->cachePath: " << http->cachePath << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
@@ -1910,12 +1987,13 @@ void Client::continueRead()
             if(!partial)
             {
                 #ifdef DEBUGFASTCGI
-                std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " internalWriteEnd();disconnect(); and !partial" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
+                struct stat sb;
+                if(fstat(readCache->getFD(),&sb)==0)
+                    std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " internalWriteEnd();disconnect(); and !partial" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << " size " << sb.st_size << std::endl;
+                else
+                    std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " internalWriteEnd();disconnect(); and !partial" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
                 #endif
-                #ifdef ONFLYENCODEFASTCGI
-                //work around
-                outputWrited=true;
-                #endif
+                //outputWrited=true; -> why is this workaround?
                 internalWriteEnd();
                 disconnect();
             }
@@ -1989,18 +2067,7 @@ void Client::continueRead()
         }
         else
             bodyAndHeaderFileBytesSended+=s;
-        #ifdef ONFLYENCODEFASTCGI
-        #ifdef DEBUGFASTCGI
-        if(!isValid())
-        {
-            std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " !isValid(): " << s << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
-            std::cerr << "search in the log: " << this << " fd close: " << std::endl;
-        }
-        #endif
-        addHeaderAndWrite(buffer,s);
-        #else
         write(buffer,s);
-        #endif
         #ifdef DEBUGFASTCGI
         //std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " continueRead(): " << s << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
         #endif
@@ -2164,7 +2231,11 @@ bool Client::detectTimeout()
      * if(fullyParsed)
         return false;*/
     const uint64_t msFrom1970=Common::msFrom1970();
-    if(creationTime>(msFrom1970-5*60*1000))
+    /*if creationTime is newer than 60min (Cache::maxDownloadTimeInMS) and:
+     * if in read: creationTimeOrUpdate newer than 60s Cache::maxDownloadIdleTimeREADInMS
+     * if in write: creationTimeOrUpdate newer than 60s Cache::maxDownloadIdleTimeWRITEInMS
+     * then max download time is 1h! */
+    if(creationTime>(msFrom1970-Cache::maxDownloadTimeInMS))
     {
         //prevent time drift
         if(creationTime>msFrom1970)
@@ -2172,15 +2243,31 @@ bool Client::detectTimeout()
             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << "Client::detectTimeout(), time drift" << std::endl;
             creationTime=msFrom1970;
         }
-        if(creationTimeOrUpdate>(msFrom1970-20*1000))
+        if(dataToWrite.empty())
         {
-            //prevent time drift
-            if(creationTimeOrUpdate>msFrom1970)
+            if(creationTimeOrUpdate>(msFrom1970-Cache::maxDownloadIdleTimeREADInMS))
             {
-                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << "Client::detectTimeout(), time drift" << std::endl;
-                creationTimeOrUpdate=msFrom1970;
+                //prevent time drift
+                if(creationTimeOrUpdate>msFrom1970)
+                {
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << "Client::detectTimeout(), time drift" << std::endl;
+                    creationTimeOrUpdate=msFrom1970;
+                }
+                return false;
             }
-            return false;
+        }
+        else
+        {
+            if(creationTimeOrUpdate>(msFrom1970-Cache::maxDownloadIdleTimeWRITEInMS))
+            {
+                //prevent time drift
+                if(creationTimeOrUpdate>msFrom1970)
+                {
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << "Client::detectTimeout(), time drift" << std::endl;
+                    creationTimeOrUpdate=msFrom1970;
+                }
+                return false;
+            }
         }
     }
 
@@ -2210,14 +2297,19 @@ bool Client::detectTimeout()
             if(tempbodyAndHeaderFileBytesSended!=bodyAndHeaderFileBytesSended)
                 std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " NO NEW DATA BUT HAVE SEND MORE DATA url: " << host << uri << " msFrom1970: " << msFrom1970 << std::endl;
             else
-                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " NO NEW DATA url: " << host << uri << " msFrom1970: " << msFrom1970 << std::endl;
+            {
+                if(!dataToWrite.empty())
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " NO NEW DATA url: " << host << uri << " msFrom1970: " << msFrom1970 << " write statured" << std::endl;
+                else
+                    std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " NO NEW DATA url: " << host << uri << " msFrom1970: " << msFrom1970 << std::endl;
+            }
         }
     }
 
     if(fullyParsed)
     {
         if(!dataToWrite.empty())
-            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Client::detectTimeout() call disconnect, remain data to write, maybe client just download the header? CURLOPT_NOBODY?";
+            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Client::detectTimeout() call disconnect, remain data to write, maybe client just download the header? CURLOPT_NOBODY? elapsed time: " << (creationTimeOrUpdate-msFrom1970);
         else
             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " Client::detectTimeout() call disconnect time: " << Common::msFrom1970() << " elapsed time: " << (creationTimeOrUpdate-msFrom1970) << "ms";
     }
@@ -2328,6 +2420,7 @@ void Client::write(const char * const data,const int &size)
     if(writedSize>0)
     {
 //        std::cerr << this << " real write writedSize: " << writedSize << " " << __FILE__ << ":" << __LINE__ <<  " : " << Common::binarytoHexa(data,writedSize) << std::endl;
+        creationTimeOrUpdate=Common::msFrom1970();
     }
     #endif
     const int temperrno=errno;
@@ -2431,7 +2524,7 @@ void Client::writeEnd(const uint64_t &fileBytesSended)
     creationTimeOrUpdate=Common::msFrom1970();
     #ifdef DEBUGFASTCGI
     const auto p1 = std::chrono::system_clock::now();
-    std::cerr << __FILE__ << ":" << __LINE__ << " Client::writeEnd(): " << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << ": " << bodyAndHeaderFileBytesSended << std::endl;
+    std::cerr << __FILE__ << ":" << __LINE__ << " Client::writeEnd(): " << std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count() << " bodyAndHeaderFileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
     if(http!=nullptr)
         std::cerr << http->getUrl() << " ";
     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
@@ -2440,7 +2533,13 @@ void Client::writeEnd(const uint64_t &fileBytesSended)
     if(!outputWrited)//mean never send nothing, header/body
     {
         #ifdef DEBUGFASTCGI
-        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " !outputWrited" << std::endl;
+        {
+            struct stat sb;
+            if(fstat(readCache->getFD(),&sb)==0)
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " !outputWrited, dataToWrite.empty(): " << std::to_string(dataToWrite.empty()) << " partial: " << std::to_string(partial) << " bodyAndHeaderFileBytesSended: " << bodyAndHeaderFileBytesSended << " cache size: " << sb.st_size << std::endl;
+            else
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " !outputWrited, dataToWrite.empty(): " << std::to_string(dataToWrite.empty()) << " partial: " << std::to_string(partial) << " bodyAndHeaderFileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
+        }
         #endif
         if(readCache!=nullptr)
         {
@@ -2461,7 +2560,7 @@ void Client::writeEnd(const uint64_t &fileBytesSended)
 
     if(!dataToWrite.empty())
     {
-        dataToWrite+=std::string(Http::fastcgiheaderend,sizeof(Http::fastcgiheaderend));
+        //dataToWrite+=std::string(Http::fastcgiheaderend,sizeof(Http::fastcgiheaderend));// -> should be into the cache file
         endTriggered=true;
         #ifdef DEBUGFILEOPEN
         std::cerr << "Client::writeEnd() pre, readCache close: " << readCache << std::endl;
@@ -2492,8 +2591,6 @@ void Client::writeEnd(const uint64_t &fileBytesSended)
         delete readCache;
         readCache=nullptr;
     }
-
-    write(Http::fastcgiheaderend,sizeof(Http::fastcgiheaderend));
 
     fastcgi_id=-1;
     if(dataToWrite.empty())
@@ -2544,10 +2641,6 @@ void Client::addHeaderAndWrite(const char * const data, const int &size)
     outputWrited=true;
 
     //FCGI_STDOUT
-    #ifdef ONFLYENCODEFASTCGI
-    uint16_t idbe=htobe16(fastcgiid);
-    memcpy(Http::fastcgiheaderstdout+1+1,&idbe,2);
-    #endif
     const uint16_t &sizebe=htobe16(size);
     memcpy(Http::fastcgiheaderstdout+1+1+2,&sizebe,2);
     write(Http::fastcgiheaderstdout,sizeof(Http::fastcgiheaderstdout));

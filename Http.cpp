@@ -189,9 +189,6 @@ Http::~Http()
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " http destructor, client " << client << std::endl;
         #endif
-        #ifdef ONFLYENCODEFASTCGI
-        client->writeEnd(client->get_bodyAndHeaderFileBytesSended());
-        #endif
         client->disconnect();
     }
     clientsList.clear();
@@ -346,6 +343,7 @@ bool Http::tryConnect(const std::string &host, const std::string &uri, const boo
     return true;
 }
 
+//always drop query in dns before this, then call WITHOUT reference HTTP object
 void Http::dnsError()
 {
     if(status!=Status_WaitDns)
@@ -385,6 +383,7 @@ void Http::dnsError()
     #endif
 }
 
+//always drop query in dns before this, then call WITHOUT reference HTTP object
 void Http::dnsWrong()
 {
     if(status!=Status_WaitDns)
@@ -752,7 +751,7 @@ bool Http::readyToRead()
         const ssize_t size=socketRead(buffer+offset,sizeof(buffer)-offset);
         readSize=size;
         #ifdef DEBUGFASTCGI
-        //if(readSize!=-1 || offset!=0) {std::cout << __FILE__ << ":" << __LINE__ << " " << readSize << " offset: " << offset << std::endl;}
+        if(readSize!=-1 || offset!=0) {std::cout << __FILE__ << ":" << __LINE__ << " " << readSize << " offset: " << offset << std::endl;}
         #endif
         if(size>0)
         {
@@ -1218,7 +1217,6 @@ bool Http::readyToRead()
                                 {
                                     headerWriten=true;
 
-                                    #ifndef ONFLYENCODEFASTCGI
                                     //fastcgi header
                                     uint16_t sizebe=htobe16(header.size());
                                     memcpy(Http::fastcgiheaderstdout+1+1+2,&sizebe,2);
@@ -1234,46 +1232,30 @@ bool Http::readyToRead()
                                         #endif
                                     }
                                     else
-                                    #endif
-                                    if(tempCache->write(header.data(),header.size())!=(ssize_t)header.size())
                                     {
-                                        std::cerr << "Header creation failed, abort to debug " << __FILE__ << ":" << __LINE__ << host << uri << " " << cachePath << std::endl;
-                                        tempCache->close();
-                                        delete tempCache;
-                                        tempCache=nullptr;
-                                        backendErrorAndDisconnect("Cache file FS access error");
-                                        #ifdef DEBUGFASTCGI
-                                        std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
-                                        #endif
-                                    }
-                                    else
-                                    {
-/*                                        epoll_event event;
-                                        memset(&event,0,sizeof(event));
-                                        event.data.ptr = tempCache;
-                                        event.events = EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLRDHUP | EPOLLERR;
-                                        //std::cerr << "EPOLL_CTL_ADD bis: " << cachefd << std::endl;
-
-                                        #ifdef DEBUGFASTCGI
-                                        std::cerr << "EPOLL_CTL_ADD: " << event.data.ptr << " " << __FILE__ << ":" << __LINE__ << std::endl;
-                                        #endif
-                                        if((uint64_t)event.data.ptr<100)
+                                        if(tempCache->write(header.data(),header.size())!=(ssize_t)header.size())
                                         {
-                                            std::cerr << "EPOLL_CTL_ADD: " << event.data.ptr << " " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
-                                            abort();
-                                        }
-
-                                        //tempCache->setAsync(); -> too hard for now*/
-
-                                        if(getFileMoved())
-                                        {
-                                            for(Client * client : clientsList)
-                                                client->startRead(cachePath,true);
+                                            std::cerr << "Header creation failed, abort to debug " << __FILE__ << ":" << __LINE__ << host << uri << " " << cachePath << std::endl;
+                                            tempCache->close();
+                                            delete tempCache;
+                                            tempCache=nullptr;
+                                            backendErrorAndDisconnect("Cache file FS access error");
+                                            #ifdef DEBUGFASTCGI
+                                            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
+                                            #endif
                                         }
                                         else
                                         {
-                                            for(Client * client : clientsList)
-                                                client->startRead(tempPath,true);
+                                            if(getFileMoved())
+                                            {
+                                                for(Client * client : clientsList)
+                                                    client->startRead(cachePath,true);
+                                            }
+                                            else
+                                            {
+                                                for(Client * client : clientsList)
+                                                    client->startRead(tempPath,true);
+                                            }
                                         }
                                     }
                                 }
@@ -1520,6 +1502,7 @@ void Http::checkIngrityHttpClient()
             if(client->http!=nullptr)
             {
                 #ifdef DEBUGDNS
+                /*not allow std::vector<HTTP*>::clear()
                 if(client->http->get_status()==Status_WaitDns)
                 {
                     if(!Dns::dns->queryHaveThisClient(client->http,client->http->host,client->http->isHttps()))
@@ -1527,7 +1510,7 @@ void Http::checkIngrityHttpClient()
                         std::cerr << "Http::checkIngrityHttpClient() " << client->http << " getStatus(): Status_WaitDns but not query have this client " << ": " << __FILE__ << ":" << __LINE__ << std::endl;
                         abort();
                     }
-                }
+                }*/
                 #endif
                 bool found=false;
                 for(Client * search : client->http->clientsList)
@@ -1592,9 +1575,6 @@ void Http::disconnectFrontend(const bool &force)
         #endif
         for(Client * client : clientsList)
         {
-            #ifdef ONFLYENCODEFASTCGI
-            client->writeEnd(client->get_bodyAndHeaderFileBytesSended());//contain Client::disconnectFromHttp()
-            #endif
             client->disconnect();
             #ifdef DEBUGFASTCGI
             std::cerr << "disconnectFrontend client: " << client << ": " << __FILE__ << ":" << __LINE__ << std::endl;
@@ -2384,7 +2364,8 @@ void Http::disconnectBackend(const bool fromDestructor)
             if(Dns::dns->queryHaveThisClient(this))
             {
                 std::cerr << "Http::disconnectBackend(): remain http " << this << " on dns " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
-                abort();
+                //abort();
+                return;
             }
             #endif
             #ifdef DEBUGFASTCGI
@@ -2845,7 +2826,16 @@ bool Http::removeClient(Client * client)
             //very heavy check
             if(Dns::dns->queryHaveThisClient(this))
             {
-                std::cerr << "Http::disconnectBackend(): remain http " << this << " on dns " << __FILE__ << ":" << __LINE__ << " (abort)" << std::endl;
+                /*#4  0x000055555559a4d6 in Http::removeClient (this=<optimized out>, client=client@entry=0x55555560ca10) at ./Http.cpp:2827
+#5  0x0000555555570285 in Client::disconnectFromHttp (this=0x55555560ca10) at ./Client.cpp:313
+#6  0x000055555557229a in Client::writeEnd (this=0x55555560ca10, fileBytesSended=<optimized out>) at ./Client.cpp:2496
+#7  0x000055555557593d in Client::internalWriteEnd (this=0x55555560ca10) at ./Client.cpp:2204
+#8  Client::httpError (this=0x55555560ca10, errorString="Dns error") at ./Client.cpp:2198
+#9  0x000055555558342c in Http::parseNonHttpError (this=this@entry=0x55555560dd30, error=error@entry=@0x7fffffffb07f: Backend::NonHttpError_DnsError) at ./Http.cpp:1982
+#10 0x000055555558e320 in Http::dnsError (this=0x55555560dd30) at ./Http.cpp:368
+then can't be abort, skip ignore this
+*/
+                std::cerr << "Http::disconnectBackend(): remain http " << this << " on dns " << __FILE__ << ":" << __LINE__ << std::endl;
                 abort();
             }
             #endif
@@ -2886,13 +2876,11 @@ int Http::writeToCache(const char * const data,const size_t &size)
         //std::cerr << "tempCache==nullptr internal error" << std::endl;
         return size;
     }
-
     if(contentsize>=0)
     {
         #ifdef DEBUGFASTCGI
         //std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " contentsize>=0 fixed size" << std::endl;
         #endif
-        #ifndef ONFLYENCODEFASTCGI
         //fastcgi header
         uint16_t sizebe=htobe16(size);
         memcpy(Http::fastcgiheaderstdout+1+1+2,&sizebe,2);
@@ -2907,7 +2895,6 @@ int Http::writeToCache(const char * const data,const size_t &size)
             std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
             #endif
         }
-        #endif
 
         const size_t &writedSize=tempCache->write((char *)data,size);
         if(writedSize!=size)
@@ -2932,10 +2919,8 @@ int Http::writeToCache(const char * const data,const size_t &size)
             #endif
             endDetected=true;
 
-            #ifndef ONFLYENCODEFASTCGI
             //FCGI_END_REQUEST
             tempCache->write(Http::fastcgiheaderend,sizeof(Http::fastcgiheaderend));
-            #endif
 
             for(Client * client : clientsList)
                 client->tryResumeReadAfterEndOfFile();
@@ -2984,7 +2969,6 @@ int Http::writeToCache(const char * const data,const size_t &size)
                         }
                         else
                         {
-                            #ifndef ONFLYENCODEFASTCGI
                             //fastcgi header
                             uint16_t sizebe=htobe16(size-pos);
                             memcpy(Http::fastcgiheaderstdout+1+1+2,&sizebe,2);
@@ -2999,7 +2983,6 @@ int Http::writeToCache(const char * const data,const size_t &size)
                                 std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
                                 #endif
                             }
-                            #endif
 
                             const size_t &writedSize=tempCache->write((char *)data+pos,size-pos);
                             (void)writedSize;
@@ -3025,7 +3008,6 @@ int Http::writeToCache(const char * const data,const size_t &size)
                         }
                         else
                         {
-                            #ifndef ONFLYENCODEFASTCGI
                             //fastcgi header
                             uint16_t sizebe=htobe16(chunkLength);
                             memcpy(Http::fastcgiheaderstdout+1+1+2,&sizebe,2);
@@ -3040,7 +3022,6 @@ int Http::writeToCache(const char * const data,const size_t &size)
                                 std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
                                 #endif
                             }
-                            #endif
 
                             const size_t &writedSize=tempCache->write((char *)data+pos,chunkLength);
                             (void)writedSize;
@@ -3099,7 +3080,7 @@ int Http::writeToCache(const char * const data,const size_t &size)
                                 if(chunkHeader.empty())
                                 {
                                     #ifdef DEBUGFASTCGI
-                                    std::cerr << "text: " << std::string(data+pos2,pos-pos2) << " " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                                    //std::cerr << "text: " << std::string(data+pos2,pos-pos2) << " " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
                                     #endif
                                     chunkLength=Common::hexaTo64Bits(std::string(data+pos2,pos-pos2));
                                     #ifdef DEBUGFASTCGI
@@ -3173,7 +3154,6 @@ int Http::writeToCache(const char * const data,const size_t &size)
                         #endif
                         endDetected=true;
 
-                        #ifndef ONFLYENCODEFASTCGI
                         //FCGI_END_REQUEST
                         tempCache->write(Http::fastcgiheaderend,sizeof(Http::fastcgiheaderend));
                         if(!streamingDetected)
@@ -3181,7 +3161,6 @@ int Http::writeToCache(const char * const data,const size_t &size)
                             for(Client * client : clientsList)
                                 client->tryResumeReadAfterEndOfFile();
                         }
-                        #endif
 
                         disconnectFrontend(false);
                         #ifdef DEBUGFASTCGI
@@ -3668,7 +3647,15 @@ std::string Http::getQuery() const
     else
         ret+=", !requestSended";
     if(tempCache!=nullptr)
-        ret+=", tempCache: "+cachePath;
+    {
+        ret+=", tempCacheFD: "+std::to_string(tempCache->getFD());
+        std::ostringstream address;
+        address << (void const *)tempCache;
+        std::string name = address.str();
+        ret+=", tempCache: "+name;
+    }
+    if(!tempPath.empty())
+        ret+=", tempPath: "+tempPath;
     if(finalCache!=nullptr)
         ret+=", finalCache: "+cachePath;
     if(endDetected)

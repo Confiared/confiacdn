@@ -13,6 +13,9 @@ std::unordered_map<int,Cache::FDSave> Cache::FDList;
 
 bool Cache::enable=true;
 uint32_t Cache::http200Time=24*3600;
+uint32_t Cache::maxDownloadTimeInMS=60*60*1000;
+uint32_t Cache::maxDownloadIdleTimeREADInMS=20*1000;
+uint32_t Cache::maxDownloadIdleTimeWRITEInMS=10*1000;
 /*uint32_t Cache::maxiumSizeToBeSmallFile=4096;
 uint64_t Cache::maxiumSmallFileCacheSize=0;//diable by default (to be safe if on ram disk)
 uint64_t Cache::smallFileCacheSize=0;*/
