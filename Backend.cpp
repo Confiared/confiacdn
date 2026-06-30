@@ -251,6 +251,40 @@ void Backend::closeSSL()
     }
 }
 
+void Backend::failAttachedHttp(const std::string &reason)
+{
+    // Mirrors the resume-retry-exhausted detach pattern in parseEvent ~L380:
+    // remove this Backend from backendList->busy and null out the
+    // cross-pointers between this Backend and its Http BEFORE routing the
+    // error. Two reasons:
+    //   1. backendErrorAndDisconnect → retryAfterError → tryConnectInternal
+    //      assigns the Http a *new* Backend; if `this` were still in busy,
+    //      the next checkBackend() integrity sweep would find a Backend in
+    //      busy with http==nullptr and abort (Backend.cpp:1997).
+    //   2. After this call returns, the Http may have entered the deferred-
+    //      delete queue, so the caller must NOT dereference `http` again.
+    if(http==nullptr)
+        return;
+    if(backendList!=nullptr)
+    {
+        size_t index=0;
+        while(index<backendList->busy.size())
+        {
+            if(backendList->busy.at(index)==this)
+            {
+                backendList->busy.erase(backendList->busy.cbegin()+index);
+                break;
+            }
+            index++;
+        }
+    }
+    Http *httpToFail=http;
+    http=nullptr;
+    httpToFail->backend=nullptr;
+    httpToFail->backendList=nullptr;
+    httpToFail->backendErrorAndDisconnect(reason);
+}
+
 void Backend::remoteSocketClosed()
 {
     #ifdef DEBUGFASTCGI
@@ -328,6 +362,16 @@ void Backend::remoteSocketClosedInternal()
             {
                 httpTempToPassCheckBackend->backend=nullptr;
                 httpTempToPassCheckBackend->backendList=nullptr;
+                // TCP connect failed (refused, host unreachable, RST during
+                // handshake) before any reply byte arrived. Surface the
+                // failure to the attached Http now instead of leaving it in
+                // Status_WaitTheContent until --maxreadtime fires (~20s) and
+                // the user gets a generic "Timeout into reply header". The
+                // 2-retry budget inside backendErrorAndDisconnect still kicks
+                // in for transient flakes — only a permanent connect failure
+                // (no live origin on this IP/port, IP-range filter, etc.)
+                // propagates 500 to the client straight away.
+                httpTempToPassCheckBackend->backendErrorAndDisconnect("TCP connect failed");
             }
             #ifdef DEBUGFASTCGI
             std::cerr << "remoteSocketClosed and was NOT TCP connected " << __FILE__ << ":" << __LINE__ << std::endl;
@@ -356,6 +400,40 @@ void Backend::remoteSocketClosedInternal()
                         #ifdef DEBUGFASTCGI
                         std::cerr << __FILE__ << ":" << __LINE__ << " backend destroy but had http client connected, try reasign" << std::endl;
                         #endif
+                        // If the origin already started sending body bytes (mid-body
+                        // disconnect), a naive reassign would resend the request to a
+                        // fresh backend and append the second response on top of the
+                        // first — corrupting the cache file (mission item 5: never cache
+                        // a partial download as complete) and making nginx report
+                        // "upstream sent more data than Content-Length". Instead, we
+                        // invoke prepareForResume() to (a) reset header-parsing state and
+                        // (b) record `resumeOffset = bytes already in cache`. The next
+                        // sendRequest() emits `Range: bytes=<resumeOffset>-`. If origin
+                        // honours it (206 Partial Content), the suffix appends cleanly;
+                        // if origin replies 200 (Range ignored), writeToCache discards
+                        // the duplicate prefix bytes from the new body so the client's
+                        // FastCGI stream stays continuous — mission item 5's recover-or-
+                        // reset semantics. Retry budget caps at 2 attempts.
+                        if(http->getContentwritten()>0 || http->headerWriten)
+                        {
+                            if(http->retryCount>=2)
+                            {
+                                #ifdef DEBUGFASTCGI
+                                std::cerr << __FILE__ << ":" << __LINE__ << " resume retry budget exhausted (" << (int)http->retryCount << "); failing" << std::endl;
+                                #endif
+                                Http *httpToFail=http;
+                                http=nullptr;
+                                httpToFail->backend=nullptr;
+                                httpToFail->backendList=nullptr;
+                                httpToFail->backendErrorAndDisconnect("Backend closed mid-body, retry exhausted");
+                                #ifdef DEBUGFASTCGI
+                                checkBackend();
+                                #endif
+                                return;
+                            }
+                            http->retryCount++;
+                            http->prepareForResume();
+                        }
                         /*if(http->requestSended)
                         {
                             std::cerr << "reassign but request already send" << std::endl;
@@ -369,9 +447,25 @@ void Backend::remoteSocketClosedInternal()
                         Http *httpTempToPassCheckBackend=http;
                         http=nullptr;
                         httpTempToPassCheckBackend->requestSended=false;
-                        #ifdef DEBUGFASTCGI
-                        checkBackend();
-                        #endif
+                        // No checkBackend() here: we just erased `this` from
+                        // backendList->busy and detached its http, so busy.size()
+                        // is transiently old-1. If pending is non-empty (the
+                        // queue hasn't drained), the invariant
+                        // `pending.empty() || busy.size()>=maxBackend` is
+                        // violated until the reassign below pushes the
+                        // replacement backend back into busy. The post-reassign
+                        // checkBackend() calls (after the idle/new branches)
+                        // verify the invariant once steady-state is restored.
+                        // Push the Http's read-side activity timestamp forward to
+                        // "now" so the next CheckTimeout sweep does NOT immediately
+                        // fire Http::detectTimeout against this Http. The timestamp
+                        // it carries reflects the last byte received on the *old*
+                        // backend (which is by definition stale — that's why we're
+                        // reassigning). Without this reset, Http::detectTimeout
+                        // races the reassign and ends up calling tryConnectInternal
+                        // on an Http that already has a fresh backend, tripping the
+                        // `backend->http==this` invariant.
+                        httpTempToPassCheckBackend->resetActivityTimestampForReassign();
                         //reassign to idle backend
                         if(!backendList->idle.empty())
                         {
@@ -428,7 +522,11 @@ void Backend::remoteSocketClosedInternal()
                         std::cerr << __FILE__ << ":" << __LINE__ << " addressToHttp.erase(): " << host << std::endl;
                         #endif
                         std::string addr((char *)&backendList->s.sin6_addr,16);
+                        #ifdef FORCEDPORT
+                        if(backendList->s.sin6_port == htobe16(FORCEDPORT))
+                        #else
                         if(backendList->s.sin6_port == htobe16(80))
+                        #endif
                         {
                             #ifdef DEBUGFASTCGI
                             std::cerr << __FILE__ << ":" << __LINE__ << " addressToHttp.erase(): " << host << ":" << be16toh(backendList->s.sin6_port) << std::endl;
@@ -459,7 +557,11 @@ void Backend::remoteSocketClosedInternal()
                                 std::cerr << "intented erase backend list have pending request (abort)" << std::endl;
                                 abort();
                             }
+                            #ifdef FORCEDPORT_TLS
+                            if(be16toh(backendList->s.sin6_port)!=FORCEDPORT_TLS)
+                            #else
                             if(be16toh(backendList->s.sin6_port)!=443)
+                            #endif
                             {
                                 std::cerr << "intented erase backend list have wrong port (abort)" << std::endl;
                                 abort();
@@ -1173,10 +1275,25 @@ void Backend::startHttps()
                 "Private key does not match public key in certificate.\n");
         return;
     }*/
-    /* Enable client certificate verification. Enable before accepting connections. */
-    /*SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT |
-    SSL_VERIFY_CLIENT_ONCE, 0);*/
+    /* Origin server certificate verification.
+     *
+     * Default (production): strict — verify the origin's cert chain against the
+     * system CA bundle. Aligns with mission item 2 ("TLS to the backend must
+     * validate; do not weaken SSL_CTX setup").
+     *
+     * BACKEND_ALLOW_SELF_SIGNED_TLS (test-only): permissive — SSL_VERIFY_NONE.
+     * The test harness uses self-signed origin certs and needs this. NEVER
+     * define this flag in a production build. */
+    #ifdef BACKEND_ALLOW_SELF_SIGNED_TLS
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, 0);
+    #else
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, 0);
+    if(SSL_CTX_set_default_verify_paths(ctx) != 1)
+    {
+        std::cerr << "SSL_CTX_set_default_verify_paths(ctx) failed; "
+                  << "TLS to backend will reject all certs" << std::endl;
+    }
+    #endif
 
     /* Start SSL negotiation, connection available. */
     ssl = SSL_new(ctx);
@@ -1200,7 +1317,26 @@ void Backend::startHttps()
         if(fd!=-1)
             ::close(fd);
         fd=-1;
+        failAttachedHttp("SSL_set_fd failed");
         return;
+    }
+    // SNI + hostname verification. Origins fronted by nginx/CDNs commonly
+    // multiplex many vhosts on one IP; without SNI the server returns the
+    // default-vhost cert (often an unrelated or expired one), and with strict
+    // SSL_VERIFY_PEER the handshake then fails for *every* HTTPS upstream.
+    // SSL_VERIFY_PEER alone only checks the chain, not the hostname — so we
+    // also have to pin the expected name via SSL_set1_host so a chain-valid
+    // cert for the wrong domain still gets rejected.
+    if(http!=nullptr)
+    {
+        const std::string &h=http->get_host();
+        if(!h.empty())
+        {
+            SSL_set_tlsext_host_name(ssl,h.c_str());
+            #ifndef BACKEND_ALLOW_SELF_SIGNED_TLS
+            SSL_set1_host(ssl,h.c_str());
+            #endif
+        }
     }
     SSL_set_connect_state(ssl);
 
@@ -1223,6 +1359,7 @@ void Backend::startHttps()
             if(fd!=-1)
                 ::close(fd);
             fd=-1;
+            failAttachedHttp("SSL_connect timeout");
             return;
         }
         int success = SSL_connect(ssl);
@@ -1253,6 +1390,7 @@ void Backend::startHttps()
                 if(fd!=-1)
                     ::close(fd);
                 fd=-1;
+                failAttachedHttp("SSL handshake closed by peer");
                 return;
             }
             else
@@ -1271,6 +1409,7 @@ void Backend::startHttps()
                     ::close(fd);
                 }
                 fd=-1;
+                failAttachedHttp("HTTPS handshake failed");
                 return;
             }
         }

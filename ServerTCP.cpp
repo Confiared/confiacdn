@@ -175,7 +175,7 @@ void ServerTCP::parseEvent(const epoll_event &)
     {
         sockaddr in_addr;
         socklen_t in_len = sizeof(in_addr);
-        const int &infd = ::accept(fd, &in_addr, &in_len);
+        const int &infd = ::accept4(fd, &in_addr, &in_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if(infd == -1)
         {
             if((errno != EAGAIN) &&

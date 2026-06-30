@@ -26,6 +26,13 @@ public:
     bool detectTimeout();
     void parseEvent(const epoll_event &event) override;
     void httpError(const std::string &errorString);
+    void httpStatus(const int &code);
+    void sendRedirectResponse(const std::string &response);
+    // Range support: serve a slice of a warm-cache file as 206 Partial Content.
+    // Returns true if it emitted a response (206 / 416). Returns false if the Range
+    // header is malformed or content-length couldn't be determined — caller should
+    // fall through to a normal full-body 200 serve.
+    bool serveRangeFromWarmCache(int cachefd);
     void writeOutputDropDataIfNeeded(const char * const data,const size_t &size);
 public:
     enum Status : uint8_t
@@ -93,6 +100,7 @@ private:
     bool outputWrited;
     std::string uri;
     std::string host;
+    std::string rangeHeader;     // raw value of HTTP_RANGE FastCGI param, if any
     uint64_t creationTime;
     uint64_t creationTimeOrUpdate;
     uint64_t bodyAndHeaderFileBytesSended;

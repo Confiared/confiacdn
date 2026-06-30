@@ -19,6 +19,13 @@ class DnsSocket;
 class Dns
 {
 public:
+    enum StatusEntry : uint8_t
+    {
+        StatusEntry_Right=0x00,
+        StatusEntry_Wrong=0x01,
+        StatusEntry_Error=0x02,
+        StatusEntry_Timeout=0x03,
+    };
     Dns();
     ~Dns();
     void parseEvent(const epoll_event &event, const DnsSocket *socket);
@@ -28,6 +35,21 @@ public:
     inline bool read16BitsRaw(uint16_t &var, const char * const data, const int &size, int &pos);
     inline bool read32Bits(uint32_t &var, const char * const data, const int &size, int &pos);
     bool tryOpenSocket();
+    void reloadStaticEntry(const std::vector<std::pair<in6_addr, std::string> > &buffer);
+    struct StaticEntryReport {
+        int ssl_roots_present = 0;
+        int ssl_subdirs_scanned = 0;
+        int ssl_entries_loaded = 0;
+        int hosts_files_present = 0;
+        int hosts_lines_total = 0;
+        int hosts_lines_loaded = 0;
+        int hosts_lines_bad_ipv6 = 0;
+        int hosts_lines_not_in_range = 0;
+        int hosts_lines_not_fqdn = 0;
+        std::vector<std::string> sources_present;
+    };
+    static std::vector<std::pair<in6_addr,std::string>> getStaticEntry(StaticEntryReport *report=nullptr);
+    static int checkStaticEntry();
     bool getAAAA(Http * http,const std::string &host,const bool &https);
     void cancelClient(Http * http,const std::string &host,const bool &https,const bool &ignoreNotFound=false);
     #ifdef DEBUGDNS
@@ -36,7 +58,7 @@ public:
     bool queryHaveThisClient(Http * http) const;
     #endif
     int requestCountMerged();
-    void cleanCache();
+    void cleanOutdatedCache();
     void checkQueries();
     uint8_t serverCount() const;
     uint8_t retryBeforeError() const;
@@ -52,13 +74,6 @@ public:
     static const unsigned char include[];
     static const unsigned char exclude[];
 private:
-    enum StatusEntry : uint8_t
-    {
-        StatusEntry_Right=0x00,
-        StatusEntry_Wrong=0x01,
-        StatusEntry_Error=0x02,
-        StatusEntry_Timeout=0x03,
-    };
     enum Mode : uint8_t
     {
         Mode_IPv6=0x00,

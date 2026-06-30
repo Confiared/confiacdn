@@ -11,6 +11,7 @@
 
 class Client;
 class Cache;
+class Http3;
 
 class Http
 {
@@ -37,10 +38,45 @@ public:
     bool tryConnect(const std::string &host, const std::string &uri, const bool &gzip, const std::string &etagBackend=std::string());
     bool getEndDetected() const;
     bool getFileMoved() const;
+    int64_t getContentwritten() const;
+    // Backend Range-resume after mid-body disconnect. Caller must have already
+    // detached this Http from its (closed) backend; after return, calling
+    // readyToWrite() / sendRequest() will issue a fresh request that, if the
+    // origin cooperates, reuses the partial body in cache.
+    void prepareForResume();
+    // Push lastReceivedBytesTimestamps to "now". Called by Backend when this
+    // Http is reassigned to a fresh Backend after the previous one timed out:
+    // without this, the stale timestamp from the previous backend would make
+    // the next CheckTimeout sweep fire Http::detectTimeout immediately, which
+    // races the just-issued reassign and trips the
+    // `backend->http==this` invariant in Http::tryConnectInternal.
+    void resetActivityTimestampForReassign();
 
     void dnsRight(const sockaddr_in6 &sIPv6);
     void dnsError();
     void dnsWrong();
+
+    // === HTTP/3-first dial + H1.1 fallback ===
+    //
+    // When `http3Enabled` is set and this is an HTTPS fetch, dnsRight()
+    // calls startH3() instead of tryConnectInternal(). The H3 leg runs
+    // in parallel with the daemon's normal event loop; detectTimeout()
+    // ticks call checkH3() once per second to drive the state machine:
+    //
+    //   * Http3 reports allStreamsDone with a usable status
+    //     (>=200 && <500): adoptH3Response() synthesizes the cache file
+    //     + emits headers/body via the existing client-emit path. Done.
+    //   * Http3 reports connFailed, deadline exceeded, or a 5xx status:
+    //     tear down the H3 leg, call Http3::markOriginFailed(m_socket),
+    //     and dispatch to tryConnectInternal(m_socket) — the standard
+    //     HTTPS leg picks up from here as if --http3 was off.
+    //
+    // The origin-failure cache short-circuits this path: if
+    // Http3::isOriginRecentlyFailed(m_socket) is true at dnsRight time,
+    // we skip H3 entirely and go straight to tryConnectInternal.
+    void startH3();
+    void checkH3();
+    bool adoptH3Response();
 #ifdef DEBUGFASTCGI
     static void checkIngrityHttpClient();
 #endif
@@ -88,6 +124,12 @@ public:
     static char buffer[65535-1000];//fastcgi don't support more than 65535-1000 bytes
     static bool useCompression;
     static bool allowStreaming;
+    // HTTP/3-first dial knobs. http3Enabled gates the new path entirely;
+    // http3DeadlineMs caps how long an in-flight H3 attempt may take
+    // before we abandon it and fall back to H1.1.
+    static bool http3Enabled;
+    static uint16_t http3Port;
+    static uint64_t http3DeadlineMs;
     std::string cachePath;
     std::string tempPath;//with random to prevent dual open
 protected:
@@ -119,9 +161,15 @@ private:
         Parsing_CacheControl,
         Parsing_AcceptRanges,
         Parsing_ETag,
+        Parsing_Location,
+        Parsing_ContentRange,
         Parsing_Content
     };
     Parsing parsing;
+    std::string location;        // captured from origin's Location header (used for 3xx forward)
+    std::string contentRange;    // captured from origin's Content-Range header (used for 206 resume)
+    int64_t resumeOffset;        // bytes already in cache before this fetch (for Range retry); -1 = fresh fetch
+    int64_t skipBytes;           // body-skip counter for 200-on-resume (origin ignored Range and replied with full body — drop the suffix we already have, then continue)
     Status status;
 
     std::string etagBackend;
@@ -144,6 +192,8 @@ public:
     #endif
     int64_t contentLengthPos;
     int64_t chunkLength;
+    Http3 *http3Conn;            // owned; non-null while H3 leg is in flight
+    uint64_t http3StartedMs;     // ms-since-1970 when H3 leg launched
     std::string chunkHeader;
     static char fastcgiheaderend[1+1+2+2+2+4+4];
     static char fastcgiheaderstdout[1+1+2+2+2];

@@ -1,4 +1,6 @@
 ﻿#include "Http.hpp"
+#include "Http3.hpp"
+#include "Http3Probe.hpp"
 #ifdef DEBUGFASTCGI
 #include "Https.hpp"
 #endif
@@ -37,6 +39,9 @@ int Http::fdRandom=-1;
 char Http::buffer[];
 bool Http::useCompression=true;
 bool Http::allowStreaming=false;
+bool Http::http3Enabled=false;
+uint16_t Http::http3Port=443;
+uint64_t Http::http3DeadlineMs=8000;
 char Http::fastcgiheaderend[];
 char Http::fastcgiheaderstdout[];
 
@@ -74,7 +79,11 @@ Http::Http(const int &cachefd, //0 if no old cache file found
     backend(nullptr),
     backendList(nullptr),
     contentLengthPos(-1),
-    chunkLength(-1)
+    chunkLength(-1),
+    http3Conn(nullptr),
+    http3StartedMs(0),
+    resumeOffset(-1),
+    skipBytes(0)
 {
     memset(&m_socket,0,sizeof(m_socket));
     memset(&m_socket.sin6_addr,0,sizeof(m_socket.sin6_addr));
@@ -180,6 +189,11 @@ Http::~Http()
     {
         delete tempCache;
         tempCache=nullptr;
+    }
+    if(http3Conn!=nullptr)
+    {
+        delete http3Conn;
+        http3Conn=nullptr;
     }
 
     disconnectFrontend(true);
@@ -457,6 +471,38 @@ void Http::dnsRight(const sockaddr_in6 &sIPv6)
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
     #endif
+    // Telemetry-only HTTP/3 probe. Runs in parallel with the HTTPS leg
+    // when --http3-probe is set. Never affects the HTTPS path.
+    if(Http3Probe::enabled && isHttps())
+    {
+        sockaddr_in6 h3target = m_socket;
+        h3target.sin6_port = Backend::https_portBE;
+        std::string probePath = uri;
+        if(probePath.empty() || probePath[0] != '/')
+            probePath = "/" + probePath;
+        Http3Probe::launch(h3target, host, probePath);
+    }
+    // HTTP/3 + HTTP/1.1 race. Both legs start in parallel when the
+    // flag is on and the origin isn't in the failure cache. checkH3
+    // arbitrates each detectTimeout tick:
+    //   * H1.1 reached client-emit (headerWriten || tempCache!=null)
+    //     before H3 finished -> H1 wins, drop H3, normal flow.
+    //   * H3 reached allStreamsDone+200 first -> H3 wins, adopt
+    //     response, disconnect H1.1 backend.
+    //   * H3 connFailed / deadline / non-2xx -> drop H3, H1.1
+    //     continues unaffected (no fallback dispatch needed since H1.1
+    //     is already running).
+    //
+    // The failure cache gates whether we even attempt H3 — if the
+    // origin failed H3 recently we skip starting the leg and save the
+    // UDP packets.
+    if(Http::http3Enabled && isHttps())
+    {
+        sockaddr_in6 h3target = m_socket;
+        h3target.sin6_port = htobe16(Http::http3Port);
+        if(!Http3::isOriginRecentlyFailed(h3target))
+            startH3();
+    }
     tryConnectInternal(m_socket);
     #ifdef DEBUGFASTCGI
     checkIngrityHttpClient();
@@ -649,7 +695,6 @@ void Http::sendRequest()
     }
     #endif
     requestSended=true;
-    if(etagBackend.empty())
     {
         std::string h(std::string("GET ")+uri);
         if(Backend::forceHttpClose)
@@ -657,36 +702,36 @@ void Http::sendRequest()
         else
             h+=" HTTP/1.1\r\nHost: ";
         h+=host+"\r\nEPNOERFT: ysff43Uy\r\n";
-        if(Http::useCompression && gzip)
-            h+="Accept-Encoding: gzip\r\n";
-        h+="\r\n";
-        #ifdef DEBUGFASTCGI
-        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " Http::sendRequest() etagBackend.empty() (no cache)" << std::endl;
-        //std::cerr << h << std::endl;
-        #endif
-        if(!socketWrite(h.data(),h.size()))
+        // Resume after mid-body disconnect: ask origin for `bytes=N-`. If origin
+        // honours Range it replies 206 Partial Content and we append the suffix
+        // to the partial cache; if origin replies 200 (Range ignored) we discard
+        // the head bytes from the new body to avoid duplicating to the client.
+        // Don't combine If-None-Match with Range — the semantics around 304 vs
+        // 206 collisions are murky, and the client has already started receiving
+        // body from the previous attempt so a 304 here is unhelpful.
+        if(resumeOffset>0)
+        {
+            h+="Range: bytes="+std::to_string(resumeOffset)+"-\r\n";
+            #ifdef DEBUGFASTCGI
+            std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " Http::sendRequest() Range: bytes=" << resumeOffset << "-" << std::endl;
+            #endif
+        }
+        else if(!etagBackend.empty())
+        {
+            h+="If-None-Match: "+etagBackend+"\r\n";
+            #ifdef DEBUGFASTCGI
+            std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " Http::sendRequest() etagBackend set to \"" << etagBackend << "\" (cache found)" << std::endl;
+            #endif
+        }
+        else
         {
             #ifdef DEBUGFASTCGI
-            std::cerr << "ERROR to write: " << h << " errno: " << errno << std::endl;
+            std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " Http::sendRequest() etagBackend.empty() (no cache)" << std::endl;
             #endif
-            startReadFromCacheAfter304();
         }
-    }
-    else
-    {
-        std::string h(std::string("GET ")+uri);
-        if(Backend::forceHttpClose)
-            h+=" HTTP/1.1\r\nConnection: close\r\nHost: ";
-        else
-            h+=" HTTP/1.1\r\nHost: ";
-        h+=host+"\r\nEPNOERFT: ysff43Uy\r\nIf-None-Match: "+etagBackend+"\r\n";
         if(Http::useCompression && gzip)
             h+="Accept-Encoding: gzip\r\n";
         h+="\r\n";
-        #ifdef DEBUGFASTCGI
-        std::cerr << this << " " << __FILE__ << ":" << __LINE__ << " Http::sendRequest() etagBackend set to \"" << etagBackend << "\" (cache found)" << std::endl;
-        //std::cerr << h << std::endl;
-        #endif
         if(!socketWrite(h.data(),h.size()))
         {
             #ifdef DEBUGFASTCGI
@@ -814,7 +859,15 @@ bool Http::readyToRead()
                             pos++;
                     }
                 }
-                if(http_code!=200)
+                // For 200 / 206 (Range resume) / 3xx (forwarded redirect) we continue to
+                // header parsing — 30x needs Location, 206 needs Content-Range. All others
+                // were already handled inside HttpReturnCode (404/500/etc. send a Status to
+                // the client; 304 reads from cache).
+                const bool keepParsingHeaders =
+                    (http_code==200) || (http_code==206) ||
+                    (http_code==301) || (http_code==302) || (http_code==303) ||
+                    (http_code==307) || (http_code==308);
+                if(!keepParsingHeaders)
                 {
                     if(backend!=nullptr)
                         flushRead();
@@ -895,6 +948,22 @@ bool Http::readyToRead()
                                     pos++;
                                 }
                             }
+                            else if((pos-pos2)==8)
+                            {
+                                std::string var(buffer+pos2,pos-pos2);
+                                std::transform(var.begin(), var.end(), var.begin(),[](unsigned char c){return std::tolower(c);});
+                                if(var=="location")
+                                {
+                                    // captured for 3xx redirect forwarding
+                                    parsing=Parsing_Location;
+                                    pos++;
+                                }
+                                else
+                                {
+                                    parsing=Parsing_HeaderVal;
+                                    pos++;
+                                }
+                            }
                             else if((pos-pos2)==12)
                             {
                                 std::string var(buffer+pos2,pos-pos2);
@@ -933,6 +1002,12 @@ bool Http::readyToRead()
                                     #ifdef DEBUGFASTCGI
                                     //std::cout << "get backend accept-ranges" << std::endl;
                                     #endif
+                                }
+                                else if(var=="content-range")
+                                {
+                                    // captured for 206 Range-resume (matches "bytes N-M/T")
+                                    parsing=Parsing_ContentRange;
+                                    pos++;
                                 }
                                 else
                                 {
@@ -976,6 +1051,109 @@ bool Http::readyToRead()
                                 }
                                 else
                                     pos++;
+
+                                // Resume after mid-body backend disconnect: cache header,
+                                // FastCGI headers record, and tempCache are already
+                                // populated from the first attempt. Just validate the
+                                // resume response (200 vs 206) and arm skipBytes /
+                                // contentsize so body-bytes append cleanly. Then drop
+                                // straight into Parsing_Content so writeToCache picks up
+                                // from the next byte. Mission item 5: byte-for-byte
+                                // identical body delivered to the client.
+                                if(resumeOffset>0 && headerWriten)
+                                {
+                                    if(http_code==206)
+                                    {
+                                        // Parse "bytes N-M/T". Trust origin for total T;
+                                        // reject if N != resumeOffset (origin gave us a
+                                        // different slice than we asked for).
+                                        int64_t parsedN=-1, parsedM=-1, parsedT=-1;
+                                        const std::string &cr=contentRange;
+                                        if(cr.size()>6 && cr.compare(0,6,"bytes ")==0)
+                                        {
+                                            size_t a=6;
+                                            size_t dash=cr.find('-',a);
+                                            size_t slash=cr.find('/',a);
+                                            if(dash!=std::string::npos && slash!=std::string::npos && dash<slash)
+                                            {
+                                                try {
+                                                    parsedN=std::stoll(cr.substr(a,dash-a));
+                                                    parsedM=std::stoll(cr.substr(dash+1,slash-dash-1));
+                                                    parsedT=std::stoll(cr.substr(slash+1));
+                                                } catch(...) {}
+                                            }
+                                        }
+                                        if(parsedT<0 || parsedN!=resumeOffset)
+                                        {
+                                            #ifdef DEBUGFASTCGI
+                                            std::cerr << this << " 206 Content-Range mismatch: cr=" << contentRange
+                                                      << " expected start=" << resumeOffset << std::endl;
+                                            #endif
+                                            backendErrorAndDisconnect("206 Content-Range mismatch");
+                                            return haveReadSomething;
+                                        }
+                                        contentsize=parsedT;
+                                        skipBytes=0;
+                                        #ifdef DEBUGFASTCGI
+                                        std::cerr << this << " resume 206 ok: total=" << contentsize
+                                                  << " offset=" << resumeOffset << std::endl;
+                                        #endif
+                                    }
+                                    else if(http_code==200)
+                                    {
+                                        // Origin ignored Range. Drop the prefix bytes from
+                                        // the new body that the client already received
+                                        // from the first attempt — assumes the body is
+                                        // deterministic (same URL, no in-flight content
+                                        // change). Caller must accept this trade.
+                                        skipBytes=resumeOffset;
+                                        // contentsize already set from Content-Length;
+                                        // contentwritten already at resumeOffset, so end-
+                                        // detect fires when contentwritten reaches total.
+                                        #ifdef DEBUGFASTCGI
+                                        std::cerr << this << " resume 200 (range ignored): skipBytes=" << skipBytes
+                                                  << " contentsize=" << contentsize << std::endl;
+                                        #endif
+                                    }
+                                    // Streaming continues from existing cache state.
+                                    break;  // exit header-parsing loop, fall through to body
+                                }
+
+                                // 3xx redirect: forward Status + Location to client
+                                // verbatim (mission item 1: status codes round-trip).
+                                // Confiacdn must NOT follow redirects server-side — clients
+                                // decide. We don't cache 30x responses here; the response
+                                // is one-shot per request.
+                                if(http_code==301 || http_code==302 || http_code==303 ||
+                                   http_code==307 || http_code==308)
+                                {
+                                    const char *reason="Found";
+                                    switch(http_code) {
+                                        case 301: reason="Moved Permanently"; break;
+                                        case 302: reason="Found"; break;
+                                        case 303: reason="See Other"; break;
+                                        case 307: reason="Temporary Redirect"; break;
+                                        case 308: reason="Permanent Redirect"; break;
+                                    }
+                                    std::string resp("Status: ");
+                                    resp+=std::to_string(http_code);
+                                    resp+=' ';
+                                    resp+=reason;
+                                    resp+="\r\n";
+                                    if(!location.empty())
+                                    {
+                                        resp+="Location: ";
+                                        resp+=location;
+                                        resp+="\r\n";
+                                    }
+                                    resp+="Content-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
+
+                                    for(Client * client : clientsList)
+                                        client->sendRedirectResponse(resp);
+                                    if(backend!=nullptr)
+                                        flushRead();
+                                    return haveReadSomething;
+                                }
 
                                 //long filetime=0;
                         /*        long http_code = 0;
@@ -1081,6 +1259,13 @@ bool Http::readyToRead()
                                 }
 
                                 const int64_t &currentTime=time(NULL);
+                                // last_modification_time_check is stored in milliseconds
+                                // (vs access_time in seconds) so that --http200Time can be
+                                // observed at sub-second precision: with second resolution,
+                                // a 2 s TTL may evaluate as 1 s or 2 s depending on
+                                // wall-clock alignment, breaking warm-fresh / warm-stale
+                                // boundary tests at the 1900/2100 ms tick.
+                                const uint64_t currentTimeMs=Common::msFrom1970();
                                 if(!tempCache->set_access_time(currentTime))
                                 {
                                     tempCache->close();
@@ -1093,7 +1278,7 @@ bool Http::readyToRead()
                                     std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " call disconnectBackend()" << std::endl;
                                     return haveReadSomething;
                                 }
-                                if(!tempCache->set_last_modification_time_check(currentTime))
+                                if(!tempCache->set_last_modification_time_check(currentTimeMs))
                                 {
                                     tempCache->close();
                                     delete tempCache;
@@ -1210,8 +1395,19 @@ bool Http::readyToRead()
                                 tempCache->seekToContentPos();
                                 if(headerWriten)
                                 {
-                                    std::cerr << "headerWriten already to true, critical error (abort)" << std::endl;
-                                    abort();
+                                    // Reachable on a resume retry where the new response
+                                    // wasn't a 206/200 we recognised as a continuation —
+                                    // the resume-detection code at line ~1011 should have
+                                    // caught those. Anything else here means we'd be
+                                    // double-writing headers into the cache file, which
+                                    // would make the FastCGI stream nginx receives invalid
+                                    // (it'd see two Status: lines). Bail out as a backend
+                                    // error rather than abort()ing the daemon — same
+                                    // outcome (client gets a synthetic error) but the
+                                    // process keeps serving other connections.
+                                    std::cerr << "headerWriten already true on second header write — backend error" << std::endl;
+                                    backendErrorAndDisconnect("Duplicate header write on resume");
+                                    return haveReadSomething;
                                 }
                                 else
                                 {
@@ -1259,6 +1455,21 @@ bool Http::readyToRead()
                                         }
                                     }
                                 }
+                                // Zero-body response (Content-Length: 0): no body chunks
+                                // will arrive, so fire end-of-content here. Without this,
+                                // the backend just sits waiting for a body that never
+                                // comes, the origin EOF eventually triggers a Range-resume
+                                // retry, and the retry trips the "headerWriten already" abort.
+                                if(contentsize==0 && tempCache!=nullptr && !endDetected)
+                                {
+                                    endDetected=true;
+                                    tempCache->write(Http::fastcgiheaderend,sizeof(Http::fastcgiheaderend));
+                                    for(Client * client : clientsList)
+                                        client->tryResumeReadAfterEndOfFile();
+                                    disconnectFrontend(false);
+                                    disconnectBackend();
+                                    return haveReadSomething;
+                                }
                                 break;
                             }
                             else
@@ -1281,6 +1492,17 @@ bool Http::readyToRead()
                                     break;
                                     case Parsing_ETag:
                                         etagBackend=std::string(buffer+pos2,pos-pos2);
+                                    break;
+                                    case Parsing_Location:
+                                        location=std::string(buffer+pos2,pos-pos2);
+                                        // Trim a leading space if origin used "Location: <url>" with a space
+                                        if(!location.empty() && location.front()==' ')
+                                            location.erase(0,1);
+                                    break;
+                                    case Parsing_ContentRange:
+                                        contentRange=std::string(buffer+pos2,pos-pos2);
+                                        if(!contentRange.empty() && contentRange.front()==' ')
+                                            contentRange.erase(0,1);
                                     break;
                                     case Parsing_ContentEncoding:
                                     if(Http::useCompression && gzip)
@@ -1732,7 +1954,7 @@ bool Http::startReadFromCacheAfter304()
     bool ok=false;
     if(finalCache!=nullptr)
     {
-        if(!finalCache->set_last_modification_time_check(time(NULL)))
+        if(!finalCache->set_last_modification_time_check(Common::msFrom1970()))
         {
             std::cerr << this << " drop corrupted cache " << cachePath << ".tmp";
             {
@@ -1771,6 +1993,16 @@ bool Http::HttpReturnCode(const int &errorCode)
 {
     if(errorCode==200)
         return true;
+    // 206 Partial Content: response to a Range request we issued for resume after
+    // a mid-body backend disconnect. Treat like 200 — the body bytes returned are
+    // the suffix [resumeOffset, end) and get appended to the existing cache file.
+    if(errorCode==206)
+        return true;
+    // 3xx redirects that are NOT 304 (revalidate). We need the Location header
+    // before responding to the client, so let header parsing continue; the
+    // emission happens at end-of-headers in readyToRead().
+    if(errorCode==301 || errorCode==302 || errorCode==303 || errorCode==307 || errorCode==308)
+        return true;
     if(errorCode==304) //when have header 304 Not Modified
     {
         #ifdef DEBUGFASTCGI
@@ -1778,6 +2010,29 @@ bool Http::HttpReturnCode(const int &errorCode)
         #endif
         if(startReadFromCacheAfter304())
             return false;
+    }
+    // 5xx during revalidation with a stale cache available → serve stale.
+    // Mission item 5: "if the origin can't be reached, fall back to the stale
+    // entry rather than returning an error to the client." Origin-side 5xx is
+    // semantically a backend failure for caching purposes.
+    if(errorCode>=500 && errorCode<600 && finalCache!=nullptr)
+    {
+        #ifdef DEBUGFASTCGI
+        std::cout << this << " HttpReturnCode " << errorCode
+                  << ": serving stale from finalCache" << std::endl;
+        #endif
+        if(startReadFromCacheAfter304())
+            return false;
+    }
+    // 4xx and 5xx: propagate the actual status code to clients. Mission item 1:
+    // "status codes must round-trip" — a 404 must finish as a 404, not as a
+    // generic 500.
+    if(errorCode>=400 && errorCode<600)
+    {
+        for(Client * client : clientsList)
+            client->httpStatus(errorCode);
+        disconnectFrontend(true);
+        return false;
     }
     const std::string errorString("Http "+std::to_string(errorCode));
     for(Client * client : clientsList)
@@ -1791,8 +2046,20 @@ void Http::retryAfterError()
 {
     std::cerr<< this << " " << __FILE__ << ":" << __LINE__ << " Http::retryAfterError() pending: " << pending << " requestSended: " << requestSended << " etagBackend: " << etagBackend << " status: " << (int)status << std::endl;
 
-    //failback 1
-    if(pending && requestSended && !etagBackend.empty())
+    //failback 1: warm cache → serve stale rather than 5xx the client.
+    //
+    // Mission item 5 / CLAUDE.md "backend leg unstable" corollary 2: when
+    // we have a previously-cached complete body (finalCache != nullptr),
+    // any unrecoverable backend error during revalidation should serve the
+    // stale entry, not propagate the failure. The original gate also
+    // required `pending && requestSended` (i.e. a queued retry where the
+    // request had already gone on the wire) — but a permanent TLS-handshake
+    // refusal, a TCP-connect-failed peer, or a silent-after-connect VPN
+    // endpoint never advances `requestSended` past zero, and those are
+    // exactly the cases the unstable-VPN topology produces. Gating on
+    // finalCache covers them all (and is the same marker used by the 5xx
+    // stale-fallback path in HttpReturnCode).
+    if(finalCache!=nullptr)
     {
         //failback to stale cache is better than fail
         //startReadFromCacheAfter304() -> included into HttpReturnCode() but HttpReturnCode() do error management
@@ -2048,6 +2315,17 @@ void Http::disconnectBackend(const bool fromDestructor)
             ::unlink(tempPath.c_str());
             moveTempToFinal=false;
             //abort();
+        }
+        else if(endDetected)
+        {
+            // Refresh the lmtc to "now" at finalisation, not at file creation. The
+            // initial lmtc was set when the first response byte arrived from origin
+            // — fine when http200Time is hours, but for short TTLs (e.g. the test
+            // matrix's --http200Time=2) a slow download can finish AFTER the cache
+            // is already considered stale, forcing pointless revalidation churn
+            // for late joiners and breaking de-dup (multi_client_flapping). Move
+            // the freshness anchor to the moment the cache became serveable.
+            tempCache->set_last_modification_time_check(Common::msFrom1970());
         }
         #ifdef DEBUGFASTCGI
         std::cerr << "Http::disconnectBackend() " << tempPath << " temp file size: " << tempSize << " (close)" << std::endl;
@@ -2867,14 +3145,30 @@ then can't be abort, skip ignore this
         clientsList.erase(p);*/
 }
 
-int Http::writeToCache(const char * const data,const size_t &size)
+int Http::writeToCache(const char * const data_in,const size_t &size_in)
 {
     if(endDetected)
         return -1;
     if(tempCache==nullptr)
     {
         //std::cerr << "tempCache==nullptr internal error" << std::endl;
-        return size;
+        return size_in;
+    }
+    // Resume-after-disconnect with origin returning 200 (Range ignored): drop
+    // the prefix bytes the client already received from the first attempt so
+    // the FastCGI stream stays continuous (mission item 5: byte-identical body
+    // delivered to the client). Origin must be deterministic — we trust that
+    // the bytes we just discarded match the bytes the client already has.
+    const char *data=data_in;
+    size_t size=size_in;
+    if(skipBytes>0 && size>0)
+    {
+        const size_t drop=(skipBytes>(int64_t)size)?size:(size_t)skipBytes;
+        skipBytes-=drop;
+        data+=drop;
+        size-=drop;
+        if(size==0)
+            return size_in;
     }
     if(contentsize>=0)
     {
@@ -3225,6 +3519,52 @@ bool Http::getFileMoved() const
     return fileMoved;
 }
 
+int64_t Http::getContentwritten() const
+{
+    return contentwritten;
+}
+
+void Http::prepareForResume()
+{
+    // The current body offset becomes the Range start for the retry. We keep
+    // contentwritten / tempCache / headerWriten intact: contentwritten so that
+    // (a) we know how far we've gone, and (b) writeToCache's "endDetected when
+    // contentwritten>=contentsize" logic continues to count from the right
+    // place after the retry's bytes append; tempCache because the partial
+    // body in cache must be preserved (so we can append rather than restart);
+    // headerWriten so we don't double-emit a Status: line + headers to the
+    // client (the client has already received the original headers from the
+    // first attempt).
+    resumeOffset=contentwritten;
+    skipBytes=0;
+    // Reset parser state so the new response is parsed fresh from the status
+    // line. The caller (Backend::remoteSocketClosed) already cleared
+    // requestSended; we redo it here for clarity.
+    http_code=0;
+    parsing=Parsing_None;
+    contentsize=-1;
+    contenttype.clear();
+    contentEncoding.clear();
+    location.clear();
+    contentRange.clear();
+    headerBuff.clear();
+    chunkLength=-1;
+    chunkHeader.clear();
+    endDetected=false;
+    streamingDetected=false;
+    requestSended=false;
+    lastReceivedBytesTimestamps=Common::msFrom1970();
+    #ifdef DEBUGFASTCGI
+    std::cerr << this << " " << __FILE__ << ":" << __LINE__
+              << " prepareForResume: resumeOffset=" << resumeOffset << std::endl;
+    #endif
+}
+
+void Http::resetActivityTimestampForReassign()
+{
+    lastReceivedBytesTimestamps=Common::msFrom1970();
+}
+
 #ifdef DEBUGFASTCGI
 void Http::checkBackend()
 {
@@ -3483,6 +3823,11 @@ void Http::checkBackend()
 bool Http::detectTimeout()
 {
     const uint64_t msFrom1970=Common::msFrom1970();
+    // H3-first poll: if an Http3 leg is in flight, advance the state
+    // machine. checkH3 either adopts the response (request finished) or
+    // dispatches H1.1 fallback (will set backend != nullptr on its way).
+    if(http3Conn!=nullptr)
+        checkH3();
     if(backend!=nullptr && status==Status_WaitTheContent && requestSended)
     {
         if(readyToRead())//try again read something, if read something the problem is the event
@@ -3664,3 +4009,282 @@ std::string Http::getQuery() const
         ret+=", !endDetected";
     return ret;
 }
+
+// === HTTP/3-first dial =====================================================
+
+void Http::startH3()
+{
+    if(http3Conn!=nullptr) return;
+    http3StartedMs = Common::msFrom1970();
+
+    sockaddr_in6 h3target = m_socket;
+    h3target.sin6_port = htobe16(Http::http3Port);
+
+    http3Conn = new Http3();
+    const std::string sessionKey = host + ":" + std::to_string(Http::http3Port);
+    if(!http3Conn->start(h3target, host, sessionKey))
+    {
+        Http3::markOriginFailed(h3target);
+        delete http3Conn;
+        http3Conn = nullptr;
+        return;
+    }
+    std::string h3path = uri;
+    if(h3path.empty() || h3path[0] != '/')
+        h3path = "/" + h3path;
+    if(!http3Conn->submitGet(host, h3path))
+    {
+        Http3::markOriginFailed(h3target);
+        delete http3Conn;
+        http3Conn = nullptr;
+        return;
+    }
+}
+
+void Http::checkH3()
+{
+    if(http3Conn==nullptr) return;
+    sockaddr_in6 h3target = m_socket;
+    h3target.sin6_port = htobe16(Http::http3Port);
+
+    // ---- H1.1 won the race ----
+    // The H1.1 parser sets tempCache before headerWriten. Once EITHER
+    // is set, H1.1 has begun client emit — H3 loses. We drop the H3 leg
+    // without marking origin failed when H3 itself was OK (just slower
+    // this round), and let H1.1 finish.
+    if(headerWriten || tempCache != nullptr)
+    {
+        if(http3Conn->allStreamsDone() &&
+           http3Conn->response().status >= 200 &&
+           http3Conn->response().status < 500)
+            Http3::markOriginSuccess(h3target);
+        delete http3Conn;
+        http3Conn = nullptr;
+        return;
+    }
+
+    const uint64_t now = Common::msFrom1970();
+    const bool deadlineExpired =
+        http3StartedMs > 0 && now > http3StartedMs + Http::http3DeadlineMs;
+    const bool connFailed = !http3Conn->isHealthy();
+    const bool done       = http3Conn->allStreamsDone();
+
+    // ---- H3 won the race ----
+    if(done && http3Conn->response().status == 200)
+    {
+        // Detach from the H1.1 leg WITHOUT going through
+        // disconnectBackend(): when the H1.1 Backend hasn't reached
+        // wasTCPConnected (e.g. origin pauses before sending the
+        // response line, exactly the slow-origin case where H3 wins),
+        // Backend::downloadFinished interprets the detach as a
+        // TCP-connect failure and fires backendErrorAndDisconnect on
+        // *us* — surfacing a 500 to the client even though H3 just
+        // succeeded. We can't take that error path during a successful
+        // adopt.
+        //
+        // Instead: orphan the Backend by clearing the back-pointer.
+        // The Backend's own state machine continues; when its connect
+        // eventually completes (or times out) it sees http==nullptr,
+        // drains any received bytes to /dev/null, returns itself to
+        // the idle pool, or is reaped by CheckTimeout. No 500 leaks
+        // back to clients.
+        if(backend != nullptr)
+        {
+            backend->http = nullptr;
+            backend = nullptr;
+        }
+        if(backendList != nullptr)
+        {
+            // If we were pending (not yet assigned a Backend), remove
+            // ourselves from the queue so we don't get one later.
+            unsigned int idx = 0;
+            while(idx < backendList->pending.size())
+            {
+                if(backendList->pending.at(idx) == this)
+                {
+                    backendList->pending.erase(
+                        backendList->pending.cbegin() + idx);
+                }
+                else
+                    idx++;
+            }
+            backendList = nullptr;
+        }
+        if(!adoptH3Response())
+        {
+            Http3::markOriginFailed(h3target);
+            delete http3Conn;
+            http3Conn = nullptr;
+            backendErrorAndDisconnect("H3 adopt failed");
+        }
+        return;
+    }
+
+    // ---- H3 lost (failed, deadlined, or non-200) ----
+    if(connFailed || deadlineExpired ||
+       (done && http3Conn->response().status >= 500))
+    {
+        Http3::markOriginFailed(h3target);
+        delete http3Conn;
+        http3Conn = nullptr;
+        // H1.1 is running in parallel; nothing more to do here.
+        return;
+    }
+    // Still in flight — nothing to do this tick.
+}
+
+bool Http::adoptH3Response()
+{
+    if(http3Conn==nullptr) return false;
+    const Http3::ResponseState &r = http3Conn->response();
+    if(r.status != 200) return false; // caller should have gated
+
+    // ----- Open tempCache -----
+    if(tempCache!=nullptr) { delete tempCache; tempCache=nullptr; }
+    tempPath = cachePath + std::string(".tmp"); // simple per-Http suffix;
+                                                  // mirrors the parser's
+                                                  // tempPath convention
+    // Append random for uniqueness same as parser.
+    {
+        char r6[6];
+        if(::read(Http::fdRandom, r6, sizeof(r6)) != (ssize_t)sizeof(r6))
+        {
+            std::memset(r6, 0, sizeof(r6));
+        }
+        std::string rand;
+        for(int i=0;i<6;++i) rand += randomETagChar(r6[i]);
+        tempPath = cachePath + rand + ".tmp";
+    }
+    ::unlink(tempPath.c_str());
+    int cachefd = ::open(tempPath.c_str(),
+                         O_RDWR | O_CREAT | O_TRUNC,
+                         S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if(cachefd == -1)
+    {
+        #ifdef HOSTSUBFOLDER
+        {
+            const std::string::size_type n=cachePath.rfind("/");
+            if(n!=std::string::npos)
+            {
+                const std::string basePath=cachePath.substr(0,n);
+                mkdir(basePath.c_str(),S_IRWXU);
+            }
+        }
+        ::unlink(tempPath.c_str());
+        cachefd = ::open(tempPath.c_str(),
+                         O_RDWR | O_CREAT | O_TRUNC,
+                         S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        #endif
+        if(cachefd == -1)
+            return false;
+    }
+    Cache::newFD(cachefd, this, EpollObject::Kind::Kind_Cache);
+    tempCache = new Cache(cachefd, nullptr);
+
+    // ----- Frontend ETag (random 6 chars; parser does the same) -----
+    char randomIndex[6];
+    if(::read(Http::fdRandom, randomIndex, sizeof(randomIndex)) !=
+       (ssize_t)sizeof(randomIndex))
+        std::memset(randomIndex, 0, sizeof(randomIndex));
+    std::string frontendEtag;
+    for(int i=0;i<6;++i) frontendEtag += randomETagChar(randomIndex[i]);
+
+    const int64_t currentTime   = time(NULL);
+    const uint64_t currentTimeMs = Common::msFrom1970();
+
+    if(!tempCache->set_access_time(currentTime) ||
+       !tempCache->set_last_modification_time_check(currentTimeMs) ||
+       !tempCache->set_http_code(200) ||
+       !tempCache->set_ETagFrontend(frontendEtag) ||
+       !tempCache->set_ETagBackend(r.etag))
+    {
+        tempCache->close();
+        delete tempCache; tempCache=nullptr;
+        return false;
+    }
+
+    // ----- Set Http parser-state members so subsequent invariants hold -----
+    http_code      = 200;
+    contenttype    = r.contentType;
+    contentEncoding= r.contentEncoding;
+    contentsize    = static_cast<int64_t>(r.body.size());
+    etagBackend    = r.etag;
+    parsing        = Parsing_Content;
+
+    // ----- Build response header bytes -----
+    std::string header;
+    if(contentsize >= 0)
+        header += "Content-Length: " + std::to_string(contentsize) + "\n";
+    if(Http::useCompression && gzip && !contentEncoding.empty())
+    {
+        header += "Content-Encoding: " + contentEncoding + "\n";
+        contentEncoding.clear();
+    }
+    if(!contenttype.empty())
+        header += "Content-Type: " + contenttype + "\n";
+    else
+        header += "Content-Type: text/html\n";
+    {
+        const std::string date   = timestampsToHttpDate(currentTime);
+        const std::string expire = timestampsToHttpDate(
+            currentTime + Cache::timeToCache(200));
+        header += "Date: "+date+"\n"
+                  "Expires: "+expire+"\n"
+                  "Cache-Control: public\n"
+                  "ETag: \""+frontendEtag+"\"\n";
+    }
+    header += "\n";
+
+    tempCache->seekToContentPos();
+
+    // ----- Write fastcgi stdout header + response header -----
+    uint16_t sizebe = htobe16(header.size());
+    std::memcpy(Http::fastcgiheaderstdout+1+1+2, &sizebe, 2);
+    if(tempCache->write(Http::fastcgiheaderstdout,
+                        sizeof(Http::fastcgiheaderstdout))
+       != (ssize_t)sizeof(Http::fastcgiheaderstdout))
+    {
+        tempCache->close();
+        delete tempCache; tempCache=nullptr;
+        return false;
+    }
+    if(tempCache->write(header.data(), header.size()) !=
+       (ssize_t)header.size())
+    {
+        tempCache->close();
+        delete tempCache; tempCache=nullptr;
+        return false;
+    }
+    headerWriten = true;
+
+    // Clients start reading the temp cache file now; writeToCache will
+    // append body bytes which they will pick up.
+    for(Client * client : clientsList)
+        client->startRead(tempPath, true);
+
+    // ----- Write body via existing path (handles fastcgi end + emit) -----
+    if(!r.body.empty())
+    {
+        writeToCache(reinterpret_cast<const char *>(r.body.data()),
+                     r.body.size());
+    }
+    else
+    {
+        // Zero-body shortcut, mirroring the parser's Content-Length:0 path.
+        endDetected = true;
+        tempCache->write(Http::fastcgiheaderend, sizeof(Http::fastcgiheaderend));
+        for(Client * client : clientsList)
+            client->tryResumeReadAfterEndOfFile();
+        disconnectFrontend(false);
+    }
+
+    // ----- Cleanup the H3 leg; mark origin as healthy -----
+    sockaddr_in6 h3target = m_socket;
+    h3target.sin6_port = htobe16(Http::http3Port);
+    Http3::markOriginSuccess(h3target);
+    delete http3Conn;
+    http3Conn = nullptr;
+    return true;
+}
+
+

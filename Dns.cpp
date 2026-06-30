@@ -10,6 +10,15 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <algorithm>
+#include <stdio.h>
+#include <dirent.h>
+#include <fstream>
+#include <sstream>
+#include <regex>
+#include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/bio.h>
 
 struct __attribute__ ((__packed__)) dns_query {
     uint16_t id;
@@ -28,14 +37,33 @@ const unsigned char Dns::exclude[]={0x28,0x03,0x19,0x20,0x00,0x00,0x00,0x00,0xb4
 std::unordered_map<std::string,std::string> Dns::hardcodedDns;
 #endif
 
+std::string readAllFile(const std::string& filePath) {
+    std::ifstream fileStream(filePath);
+    if (!fileStream.is_open()) {
+        std::cerr << "Error: Could not open the file " << filePath << std::endl;
+        return "";
+    }
+    std::stringstream buffer;
+    buffer << fileStream.rdbuf();
+    return buffer.str();
+}
+
 Dns::Dns()
 {
     memset(&targetHttp,0,sizeof(targetHttp));
+    #ifdef FORCEDPORT
+    targetHttp.sin6_port = htobe16(FORCEDPORT);
+    #else
     targetHttp.sin6_port = htobe16(80);
+    #endif
     targetHttp.sin6_family = AF_INET6;
 
     memset(&targetHttps,0,sizeof(targetHttps));
+    #ifdef FORCEDPORT_TLS
+    targetHttps.sin6_port = htobe16(FORCEDPORT_TLS);
+    #else
     targetHttps.sin6_port = htobe16(443);
+    #endif
     targetHttps.sin6_family = AF_INET6;
 
     httpInProgress=0;
@@ -144,6 +172,7 @@ Dns::Dns()
         if (line)
             free(line);
     }
+
     while(indexPreferedServerOrder<MAXDNSSERVER)
     {
         preferedServerOrder[indexPreferedServerOrder]=0;
@@ -162,6 +191,255 @@ Dns::~Dns()
 {
 }
 
+std::vector<std::string> regex_split(const std::string& str, const std::regex& delim_regex) {
+    std::sregex_token_iterator iter(str.begin(), str.end(), delim_regex, -1);
+    std::sregex_token_iterator end;
+    std::vector<std::string> tokens;
+    std::copy(iter, end, std::back_inserter(tokens));
+    return tokens;
+}
+
+bool isValidFQDN(const std::string& fqdn) {
+    // Regular expression for validating a FQDN.
+    // Breakdown:
+    // ^          - Start of the string.
+    // (          - Start of a capturing group for a label (allows subdomains).
+    //  (?!-)     - Negative lookahead: the label cannot start with a hyphen.
+    //  [A-Za-z0-9-]{1,63} - Matches 1 to 63 alphanumeric characters or hyphens.
+    //  (?<!-)    - Negative lookbehind: the label cannot end with a hyphen.
+    //  \\.       - Matches a literal dot (period).
+    // )+         - This group must appear at least once.
+    // [A-Za-z]{2,63} - The top-level domain (TLD) must be 2 to 63 letters long.
+    // \\.?       - Optional trailing dot.
+    // $          - End of the string.
+
+    // Note: C++ std::regex might not fully support negative lookbehind (?<!-).
+    // A safer, more compatible, regex without lookbehind is provided below.
+
+    // Alternative regex which is widely compatible and meets common needs.
+    // This requires separate length checks for total FQDN length (max 255 chars).
+    std::regex regex_pattern("^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z]{2,63}\\.?$");
+
+    // The total length must not exceed 255 characters (including optional trailing dot).
+    if (fqdn.length() > 255) {
+        return false;
+    }
+
+    return std::regex_match(fqdn, regex_pattern);
+}
+
+std::vector<std::pair<in6_addr,std::string>> Dns::getStaticEntry(StaticEntryReport *report)
+{
+    std::vector<std::pair<in6_addr,std::string>> buffer;
+    {
+        std::vector<std::string> ipv6sslpathslist={"ssl/","/etc/nginx/ssl/"};
+        for (std::string pathssl : ipv6sslpathslist) {
+            DIR *dr;
+            struct dirent *de;
+            dr = opendir(pathssl.c_str());
+            if (dr != NULL)
+            {
+                if(report)
+                {
+                    report->ssl_roots_present++;
+                    report->sources_present.push_back(pathssl);
+                }
+                while ((de = readdir(dr)) != NULL) {
+                    if(de->d_name[0]!='.')
+                    {
+                        if(report)
+                            report->ssl_subdirs_scanned++;
+                        std::string fileContent=readAllFile(pathssl+de->d_name+"/dest");
+                        fileContent.erase(std::remove(fileContent.begin(),fileContent.end(),'\n'),fileContent.end());
+                        BIO *bio = BIO_new_file(std::string(pathssl+de->d_name+"/cert.pem").c_str(), "r");
+                        if(bio)
+                        {
+                            X509 *cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+                            if(cert!=NULL)
+                            {
+                                STACK_OF(GENERAL_NAME) *san_names = (STACK_OF(GENERAL_NAME)*)X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
+                                if (san_names != NULL)
+                                {
+                                    int num_san = sk_GENERAL_NAME_num(san_names);
+                                    for(int i = 0; i < num_san; i++)
+                                    {
+                                        GENERAL_NAME *gn = sk_GENERAL_NAME_value(san_names, i);
+                                        if (gn->type == GEN_DNS)
+                                        {
+                                            struct in6_addr ipv6_addr_struct;
+                                            int success = inet_pton(AF_INET6, fileContent.c_str(), &ipv6_addr_struct);
+                                            if (success == 1)
+                                            {
+                                                const char *dns_name = (const char *)ASN1_STRING_get0_data(gn->d.dNSName);
+                                                #ifdef DEBUGDNS
+                                                std::cout << "from rproxy: " << dns_name << " -> " << fileContent << std::endl;
+                                                #endif
+                                                buffer.push_back(std::pair<in6_addr,std::string>(ipv6_addr_struct,dns_name));
+                                                if(report)
+                                                    report->ssl_entries_loaded++;
+                                            }
+                                        }
+                                    }
+                                    sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
+                                }
+                                X509_free(cert);
+                            }
+                            BIO_free(bio);
+                        }
+                    }
+                }
+                closedir(dr);
+            }
+        }
+    }
+
+    {
+        std::vector<std::string> hostslist={"hosts"};
+        for (std::string pathhosts : hostslist)
+        {
+            std::ifstream inputFile(pathhosts);
+            std::string line;
+            if (inputFile.is_open())
+            {
+                if(report)
+                {
+                    report->hosts_files_present++;
+                    report->sources_present.push_back(pathhosts);
+                }
+                while (std::getline(inputFile, line))
+                {
+                    line.erase(std::remove(line.begin(),line.end(),'\n'),line.end());
+                    line.erase(std::remove(line.begin(),line.end(),'\r'),line.end());
+                    if(!line.empty() && line.at(0)!='#')
+                    {
+                        if(report)
+                            report->hosts_lines_total++;
+                        std::vector<std::string> l=regex_split(line,std::regex("[ \t]+"));
+                        if(l.size()>=2)
+                        {
+                            struct in6_addr ipv6_addr_struct;
+                            int success = inet_pton(AF_INET6, l.at(0).c_str(), &ipv6_addr_struct);
+                            if (success == 1)
+                            {
+                                if(memcmp(&ipv6_addr_struct,Dns::include,sizeof(Dns::include))!=0 || memcmp(&ipv6_addr_struct,Dns::exclude,sizeof(Dns::exclude))==0)
+                                {
+                                    if(report)
+                                        report->hosts_lines_not_in_range++;
+                                }
+                                else
+                                {
+                                    unsigned int index=1;
+                                    bool loadedAny=false;
+                                    bool anyNotFQDN=false;
+                                    while(index<l.size())
+                                    {
+                                        if(isValidFQDN(l.at(index)))
+                                        {
+                                            #ifdef DEBUGDNS
+                                            std::cout << "from hosts: " << l.at(index) << " -> " << l.at(0) << std::endl;
+                                            #endif
+                                            buffer.push_back(std::pair<in6_addr,std::string>(ipv6_addr_struct,l.at(index)));
+                                            loadedAny=true;
+                                        }
+                                        else
+                                        {
+                                            anyNotFQDN=true;
+                                        }
+                                        index++;
+                                    }
+                                    if(report)
+                                    {
+                                        if(loadedAny)
+                                            report->hosts_lines_loaded++;
+                                        else if(anyNotFQDN)
+                                            report->hosts_lines_not_fqdn++;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                if(report)
+                                    report->hosts_lines_bad_ipv6++;
+                            }
+                        }
+                        else
+                        {
+                            if(report)
+                                report->hosts_lines_bad_ipv6++;
+                        }
+                    }
+                }
+                inputFile.close();
+            }
+        }
+    }
+    return buffer;
+}
+
+int Dns::checkStaticEntry()
+{
+    StaticEntryReport report;
+    const std::vector<std::pair<in6_addr,std::string>> entries = getStaticEntry(&report);
+    const int total = static_cast<int>(entries.size());
+
+    std::cout << "static-dns: scanning sources..." << std::endl;
+    if(report.sources_present.empty())
+        std::cout << "  (no source files found)" << std::endl;
+    else
+    {
+        for(const std::string &p : report.sources_present)
+            std::cout << "  source present: " << p << std::endl;
+    }
+    std::cout << "  ssl roots present: " << report.ssl_roots_present
+              << ", subdirs scanned: " << report.ssl_subdirs_scanned
+              << ", entries loaded: " << report.ssl_entries_loaded << std::endl;
+    std::cout << "  hosts files present: " << report.hosts_files_present
+              << ", lines: " << report.hosts_lines_total
+              << ", loaded: " << report.hosts_lines_loaded
+              << ", bad-ipv6: " << report.hosts_lines_bad_ipv6
+              << ", not-in-range: " << report.hosts_lines_not_in_range
+              << ", not-fqdn: " << report.hosts_lines_not_fqdn << std::endl;
+    std::cout << "static-dns: total loaded = " << total << std::endl;
+
+    if(report.ssl_entries_loaded == 0)
+    {
+        std::cerr << "static-dns: FAIL: zero entries loaded from SSL cert dirs "
+                     "(ssl/, /etc/nginx/ssl/) — that is the source of truth; "
+                     "roots present: " << report.ssl_roots_present
+                  << ", subdirs scanned: " << report.ssl_subdirs_scanned << std::endl;
+        return 1;
+    }
+    const int hosts_files_with_lines = report.hosts_lines_total > 0 ? report.hosts_files_present : 0;
+    if(report.hosts_lines_loaded == 0 && hosts_files_with_lines > 0)
+    {
+        std::cerr << "static-dns: FAIL: hosts file present with " << report.hosts_lines_total
+                  << " line(s) but 0 valid entries" << std::endl;
+        return 1;
+    }
+    std::cout << "static-dns: OK" << std::endl;
+    return 0;
+}
+
+void Dns::reloadStaticEntry(const std::vector<std::pair<in6_addr,std::string>> &buffer)
+{
+    if(dns==nullptr)
+    {
+        std::cerr << "unable to load static content, dns not set" << std::endl;
+        return;
+    }
+    //clean cache
+    cacheAAAA.clear();
+    cacheAAAAByOutdatedDate.clear();
+
+    unsigned int index=0;
+    while(index<buffer.size())
+    {
+        const std::pair<in6_addr,std::string> &e=buffer.at(index);
+        addCacheEntry(StatusEntry_Right,365*24*3600,e.second,e.first);
+        index++;
+    }
+}
+
 bool Dns::tryOpenSocket()
 {
     {
@@ -178,7 +456,7 @@ bool Dns::tryOpenSocket()
         si_me.sin_addr.s_addr = htonl(INADDR_ANY);
         if(bind(fd,(struct sockaddr*)&si_me, sizeof(si_me))==-1)
         {
-            std::cerr << "unable to bind UDP socket, errno: " << errno << std::endl;
+            std::cerr << "unable to bind UDP socket 50053, errno: " << errno << std::endl;
             abort();
         }
 
@@ -209,7 +487,7 @@ bool Dns::tryOpenSocket()
         si_me.sin6_addr = IN6ADDR_ANY_INIT;
         if(bind(fd,(struct sockaddr*)&si_me, sizeof(si_me))==-1)
         {
-            std::cerr << "unable to bind UDP socket, errno: " << errno << std::endl;
+            std::cerr << "unable to bind UDP socket 50054, errno: " << errno << std::endl;
             abort();
         }
 
@@ -459,8 +737,9 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                 for(Http * const c : https)
                                     c->dnsError();
                             }
+                            std::cerr << "ERROR " << __FILE__ << ":" << __LINE__ << " remove query for host " << q.host << " due to wrong string to resolve, host is not dns valid: " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
                             #ifdef DEBUGDNS
-                            std::cerr << __FILE__ << ":" << __LINE__ << " remove query due to  wrong string to resolve, host is not dns valid: " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
+                            std::cerr << __FILE__ << ":" << __LINE__ << " remove query for host " << q.host << " due to wrong string to resolve, host is not dns valid: " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
                             #endif
                             removeQuery(transactionId);
                             #ifdef DEBUGDNS
@@ -514,8 +793,9 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                 for(Http * const c : https)
                                     c->dnsError();
                             }
+                            std::cerr << "ERROR " << __FILE__ << ":" << __LINE__ << " remove query for host " << q.host << " due to " << q.host << " wrong string to resolve, host is not dns valid: " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
                             #ifdef DEBUGDNS
-                            std::cerr << __FILE__ << ":" << __LINE__ << " remove query due to (flags & 0xFA0F)!=0x8000: " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
+                            std::cerr << __FILE__ << ":" << __LINE__ << " remove query for host " << q.host << " due to (flags & 0xFA0F)!=0x8000: " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
                             #endif
                             removeQuery(transactionId);
                             #ifdef DEBUGDNS
@@ -585,7 +865,7 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                             c->dnsError();
                                     }
                                     #ifdef DEBUGDNS
-                                    std::cerr << __FILE__ << ":" << __LINE__ << " remove query due to failed read type: " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
+                                    std::cerr << __FILE__ << ":" << __LINE__ << " remove query for host " << q.host << " due to failed read type: " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
                                     #endif
                                     removeQuery(transactionId);
                                     #ifdef DEBUGDNS
@@ -805,7 +1085,7 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
                                     c->dnsError();
                             }
                             #ifdef DEBUGDNS
-                            std::cerr << __FILE__ << ":" << __LINE__ << " if(!clientsFlushed): " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
+                            std::cerr << __FILE__ << ":" << __LINE__ << "  for host " << q.host << " if(!clientsFlushed): " << transactionId << " into " << (Common::msFrom1970()-q.startTimeInms) << "ms" << std::endl;
                             #endif
                             removeQuery(transactionId);
                             #ifdef DEBUGDNS
@@ -831,7 +1111,7 @@ void Dns::parseEvent(const epoll_event &event,const DnsSocket *socket)
     #endif
 }
 
-void Dns::cleanCache()
+void Dns::cleanOutdatedCache()
 {
     if(cacheAAAA.size()<100000)
         return;
@@ -1002,6 +1282,22 @@ bool Dns::read32Bits(uint32_t &var, const char * const data, const int &size, in
 
 bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
 {
+    #ifdef FORCEALLDNSTOLOCALHOSTIPV6
+    // Test-harness short-circuit: every name resolves to ::1, no UDP query, no range checks.
+    // Picks the http or https sockaddr template (already carries the right port — see Dns::Dns())
+    // and fires dnsRight() synchronously so the call site behaves as if the resolver answered immediately.
+    if(client==nullptr)
+    {
+        std::cerr << __FILE__ << ":" << __LINE__ << " Dns::get() client==nullptr" << std::endl;
+        abort();
+    }
+    (void)host;
+    sockaddr_in6 s = https ? targetHttps : targetHttp;
+    memset(&s.sin6_addr, 0, sizeof(s.sin6_addr));
+    s.sin6_addr.s6_addr[15] = 1; // ::1
+    client->dnsRight(s);
+    return true;
+    #endif
     #ifdef DEBUGDNS
     checkCorruption();
     #endif
@@ -1138,6 +1434,7 @@ bool Dns::getAAAA(Http * client, const std::string &host, const bool &https)
                 break;
                 default:
                 case StatusEntry_Error:
+                    std::cerr << __FILE__ << ":" << __LINE__ << " return DNS cache is ERROR for " << host << std::endl;
                     #ifdef DEBUGDNS
                     std::cerr << __FILE__ << ":" << __LINE__ << std::endl;
                     #endif
@@ -1965,6 +2262,8 @@ void Dns::checkQueries()
 #ifdef DEBUGDNS
 void Dns::checkCorruption()
 {
+    if(Dns::dns==nullptr)
+        return;
     std::unordered_set<uint16_t> inHost;
     for( const auto& n : Dns::dns->queryListByHost ) {
         const std::string &host=n.first;

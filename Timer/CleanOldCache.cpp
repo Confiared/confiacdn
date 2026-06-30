@@ -16,7 +16,9 @@ CleanOldCache::CleanOldCache() :
 //exec each 1s to remove each 1s to remove
 void CleanOldCache::exec()
 {
-    #ifndef CURL
+    /*#ifdef DEBUGFASTCGI call each second
+    std::cerr << "start remove old cache" << std::endl;
+    #endif*/
     const uint64_t &currentTime=Common::msFrom1970()/1000;
     //check each 1h
     if((lastCleanTime+3600)>currentTime)
@@ -71,5 +73,7 @@ void CleanOldCache::exec()
     }
     else
         d = opendir(".");
-    #endif
+    /*#ifdef DEBUGFASTCGI
+    std::cerr << "end remove old cache" << std::endl;
+    #endif*/
 }

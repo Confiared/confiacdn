@@ -1,6 +1,5 @@
-#include "Server.hpp"
-#include "Client.hpp"
-#include "Dns.hpp"
+#include "ServerReload.hpp"
+#include "ClientReload.hpp"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <iostream>
@@ -12,9 +11,9 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
-Server::Server(const char *const path)
+ServerReload::ServerReload(const char *const path)
 {
-    this->kind=EpollObject::Kind::Kind_Server;
+    this->kind=EpollObject::Kind::Kind_ServerReload;
 
     if((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
     {
@@ -70,7 +69,7 @@ Server::Server(const char *const path)
     }
 }
 
-void Server::parseEvent(const epoll_event &)
+void ServerReload::parseEvent(const epoll_event &)
 {
     while(1)
     {
@@ -84,21 +83,12 @@ void Server::parseEvent(const epoll_event &)
                 std::cout << "connexion accepted" << std::endl;
             return;
         }
-        if(Dns::dns->requestCountMerged()>1000)
-        {
-            #ifdef DEBUGFILEOPEN
-            std::cerr << "Server::parseEvent(), fd: " << infd << std::endl;
-            #endif
-            ::close(infd);
-            return;
-        }
-
         //do the stuff
-        Client *client=new Client(infd);
+        ClientReload *client=new ClientReload(infd);
         //setup unix socket non blocking and listen
         epoll_event event;
         event.data.ptr = client;
-        event.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP | EPOLLHUP | EPOLLERR;// | EPOLLONESHOT: broke
+        event.events = EPOLLIN  | EPOLLET | EPOLLRDHUP | EPOLLHUP | EPOLLERR;// | EPOLLONESHOT: broke
         #ifdef DEBUGFASTCGI
         std::cerr << "EPOLL_CTL_ADD: " << event.data.ptr << " " << __FILE__ << ":" << __LINE__ << std::endl;
         #endif

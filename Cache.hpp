@@ -31,6 +31,11 @@ public:
     bool seekToContentPos();
     ssize_t write(const char * const data,const size_t &size);
     ssize_t read(char * data,const size_t &size);
+    // Linux zero-copy: push up to maxBytes from the cache fd's current seek
+    // position into out_fd (a non-blocking SOCK_STREAM fd). Mirrors read():
+    // returns bytes transferred (advances the cache fd's seek pos by that many),
+    // 0 at EOF, -1 on error with errno set (EAGAIN when out_fd would block).
+    ssize_t sendfileTo(const int &out_fd,const size_t &maxBytes);
     static uint32_t timeToCache(uint16_t http_code);
     ssize_t size() const;
 

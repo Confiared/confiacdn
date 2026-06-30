@@ -1,12 +1,16 @@
 #include <errno.h>
 #include <sys/epoll.h>
 #include "Server.hpp"
+#include "ServerReload.hpp"
 #ifdef DEBUGFASTCGITCP
 #include "ServerTCP.hpp"
 #endif
 #include "Common.hpp"
 #include "Client.hpp"
+#include "ClientReload.hpp"
 #include "Http.hpp"
+#include "Http3.hpp"
+#include "Http3Probe.hpp"
 #include "Dns.hpp"
 #include "Backend.hpp"
 #include "Cache.hpp"
@@ -26,6 +30,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <chrono>
 
 #define MAX_EVENTS 1024
 
@@ -38,6 +45,76 @@ void signal_callback_handler(int signum) {
 
 int main(int argc, char *argv[])
 {
+    if(argc==2 && strcmp(argv[1],"--check-static-dns")==0)
+    {
+        return Dns::checkStaticEntry();
+    }
+    if(argc==2 && strcmp(argv[1],"reload")==0)
+    {
+        auto start = std::chrono::steady_clock::now();
+        sockaddr_un addr;
+        int fd;
+
+        if ( (fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+          perror("socket error");
+          exit(-1);
+        }
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, "reload.sock", sizeof(addr.sun_path)-1);
+
+        if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+          perror("connect error");
+          exit(-1);
+        }
+
+        const std::vector<std::pair<in6_addr,std::string>> &data=Dns::getStaticEntry();
+        unsigned int buffersize=0;
+        {
+            unsigned int index=0;
+            while(index<data.size())
+            {
+                const std::pair<in6_addr,std::string> &e=data.at(index);
+                if(e.second.size()<255)
+                {
+                    buffersize+=sizeof(in6_addr);
+                    buffersize+=sizeof(uint8_t);
+                    buffersize+=e.second.size();
+                }
+                index++;
+            }
+        }
+        char buffer[buffersize];
+        {
+            size_t pos=0;
+            unsigned int index=0;
+            while(index<data.size())
+            {
+                const std::pair<in6_addr,std::string> &e=data.at(index);
+                if(e.second.size()<255)
+                {
+                    memcpy(buffer,&e.first,sizeof(e.first));pos+=sizeof(e.first);
+                    const uint8_t &s=e.second.size();
+                    memcpy(buffer,&s,sizeof(s));pos+=sizeof(s);
+                    memcpy(buffer,e.second.data(),s);pos+=s;
+                }
+                index++;
+            }
+        }
+        auto end = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        long long milliseconds = duration.count();
+        std::cout << "loaded and serialised into: " << milliseconds << " ms" << std::endl;
+
+        if(::write(fd, buffer, buffersize) != (ssize_t)buffersize)
+        {
+            std::cerr << "failed to write" << std::endl;
+            return -1;
+        }
+
+        return 0;
+    }
     std::cout << "start main()" << std::endl;
     #ifdef FASTCGIASYNC
     std::cerr << "compiled with ASYNC support" << std::endl;
@@ -55,7 +132,11 @@ int main(int argc, char *argv[])
         abort();
     }
     memset(Http::buffer,0,sizeof(Http::buffer));
-    Backend::https_portBE=be16toh(443);
+    #ifdef FORCEDPORT_TLS
+    Backend::https_portBE=htobe16(FORCEDPORT_TLS);
+    #else
+    Backend::https_portBE=htobe16(443);
+    #endif
 
     for (int i = 1; i < argc; ++i) {
         std::string argvcpp(argv[i]);
@@ -80,6 +161,18 @@ int main(int argc, char *argv[])
             #endif
             Http::useCompression=false;
         }
+        else if (argvcpp == "--http3") {
+            Http::http3Enabled = true;
+            #ifdef DEBUGFASTCGI
+            std::cout << "HTTP/3-first dial enabled for HTTPS fetches" << std::endl;
+            #endif
+        }
+        else if (argvcpp == "--http3-probe") {
+            Http3Probe::enabled = true;
+            #ifdef DEBUGFASTCGI
+            std::cout << "Now HTTP/3 telemetry probe enabled" << std::endl;
+            #endif
+        }
         else if (argvcpp == "--disableStreaming") {
             #ifdef DEBUGFASTCGI
             std::cout << "Now streaming disabled (parse as normal file)" << std::endl;
@@ -96,6 +189,11 @@ int main(int argc, char *argv[])
                     std::cerr << "--forcehttpclose: force http close connection after each request" << std::endl;
                     std::cerr << "--disableCompressionForBackend: disable request http compression for backend" << std::endl;
                     std::cerr << "--disableStreaming: disable streaming detection and replay" << std::endl;
+                    std::cerr << "--http3-probe: telemetry-only HTTP/3 side-channel for HTTPS fetches (logs only, no traffic effect)" << std::endl;
+                    std::cerr << "--http3: dial HTTPS fetches over HTTP/3 first, fall back to HTTP/1.1 on failure or timeout" << std::endl;
+                    std::cerr << "--http3-port=443: UDP port for HTTP/3 backend dials" << std::endl;
+                    std::cerr << "--http3-deadline-ms=8000: per-fetch HTTP/3 budget; on expiry the daemon falls back to HTTP/1.1" << std::endl;
+                    std::cerr << "--check-static-dns: parse static-DNS sources (ssl/, /etc/nginx/ssl/, hosts) and exit 0 on success / non-zero if a source is present but yields no entries" << std::endl;
                     //std::cerr << "--maxiumSizeToBeSmallFile: (TODO) if smaller than this size, save into RAM, performance features where syscall have time more check and is slower (few bandwith is lost if restart/redownload, too small content, but hurge performance impact)" << std::endl;
                     //std::cerr << "--maxiumSmallFileCacheSize: (TODO) The maximum content stored in RAM, this cache prevent syscall and disk seek, performance features where syscall have time more check and is slower (few bandwith is lost if restart/redownload, too small content, but hurge performance impact)" << std::endl;
                     return 1;
@@ -128,6 +226,18 @@ int main(int argc, char *argv[])
                     Cache::maxDownloadIdleTimeWRITEInMS=std::stoi(val)*1000;
                     #ifdef DEBUGFASTCGI
                     std::cout << "Now Cache::maxDownloadIdleTimeWRITEInMS is " << Cache::maxDownloadIdleTimeWRITEInMS << "s" << std::endl;
+                    #endif
+                }
+                else if (var=="--http3-port") {
+                    Http::http3Port = static_cast<uint16_t>(std::stoi(val));
+                    #ifdef DEBUGFASTCGI
+                    std::cout << "Now Http::http3Port is " << Http::http3Port << std::endl;
+                    #endif
+                }
+                else if (var=="--http3-deadline-ms") {
+                    Http::http3DeadlineMs = static_cast<uint64_t>(std::stoull(val));
+                    #ifdef DEBUGFASTCGI
+                    std::cout << "Now Http::http3DeadlineMs is " << Http::http3DeadlineMs << "ms" << std::endl;
                     #endif
                 }
                 else if (var=="--maxBackend") { //--maxBackend=64
@@ -177,6 +287,7 @@ int main(int argc, char *argv[])
     }
     EpollObject::epollfd=epollfd;
     Dns::dns=new Dns();
+    Dns::dns->reloadStaticEntry(Dns::getStaticEntry());
     DNSCache dnsCache;
     dnsCache.start(3600*1000);
     DNSQuery dnsQuery;
@@ -253,6 +364,7 @@ int main(int argc, char *argv[])
 
     /*Server *server=*///new Server("/run/fastcgicdn.sock");
     Server s("fastcgicdn.sock");
+    ServerReload sR("reload.sock");
     #ifdef DEBUGFASTCGITCP
     ServerTCP sTcp("127.0.0.1","5556");
     #endif
@@ -409,6 +521,12 @@ int main(int argc, char *argv[])
                     server->parseEvent(e);
                 }
                 break;
+                case EpollObject::Kind::Kind_ServerReload:
+                {
+                    ServerReload * server=static_cast<ServerReload *>(e.data.ptr);
+                    server->parseEvent(e);
+                }
+                break;
                 case EpollObject::Kind::Kind_Client:
                 {
                     #ifdef DEBUGFASTCGI
@@ -427,6 +545,17 @@ int main(int argc, char *argv[])
                         //if(!deleteClient.empty() && deleteClient.back()!=client)
                         newDeleteClient.insert(client);
                         client->disconnect();
+                    }
+                }
+                break;
+                case EpollObject::Kind::Kind_ClientReload:
+                {
+                    ClientReload * client=static_cast<ClientReload *>(e.data.ptr);
+                    client->parseEvent(e);
+                    if(!client->isValid())
+                    {
+                        client->disconnect();
+                        delete client;
                     }
                 }
                 break;
@@ -462,6 +591,12 @@ int main(int argc, char *argv[])
                     static_cast<Timer *>(e.data.ptr)->validateTheTimer();
                 }
                 break;
+                case EpollObject::Kind::Kind_Http3:
+                {
+                    Http3 * h3=static_cast<Http3 *>(e.data.ptr);
+                    h3->parseEvent(e);
+                }
+                break;
                 #ifdef DEBUGFASTCGITCP
                 case EpollObject::Kind::Kind_ServerTCP:
                 {
@@ -491,9 +626,23 @@ int main(int argc, char *argv[])
         for(Http * r : Http::httpToDelete)
             std::cerr << "http planed to delete: " << r << " " << __FILE__ << ":" << __LINE__ << std::endl;
         #endif
-        newDeleteClient.insert(Client::clientToDelete.begin(),Client::clientToDelete.end());
+        // Filter: don't re-queue clients/http already in oldDeleteClient/Http.
+        // Those items are about to be deleted at the top of the *next* iteration
+        // (line 353 / line 405). If we re-add them here, they re-enter
+        // newDeleteClient → next-next iter's oldDeleteClient → a second delete
+        // attempt on an already-freed pointer ("delete Client failed, not found
+        // into debug" — see the multi_client_flapping test case). The race is:
+        // CheckTimeout iterates Client::clients between the iter that marks the
+        // client invalid and the iter that actually deletes it; the client is
+        // still in clients (destructor hasn't run yet) and CheckTimeout adds
+        // it to Client::clientToDelete a second time.
+        for(Client * client : Client::clientToDelete)
+            if(oldDeleteClient.find(client) == oldDeleteClient.cend())
+                newDeleteClient.insert(client);
         Client::clientToDelete.clear();
-        newDeleteHttp.insert(Http::httpToDelete.begin(),Http::httpToDelete.end());
+        for(Http * http : Http::httpToDelete)
+            if(oldDeleteHttp.find(http) == oldDeleteHttp.cend())
+                newDeleteHttp.insert(http);
         Http::httpToDelete.clear();
     }
 

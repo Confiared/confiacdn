@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/sendfile.h>
 
 std::unordered_map<int,Cache::FDSave> Cache::FDList;
 
@@ -179,8 +180,12 @@ std::string Cache::ETagBackend() const
 {
     uint8_t etagBackendSize=0;
     #ifdef PREADPWRITE
-    if(::pread(fd,&etagBackendSize,sizeof(etagBackendSize),3*sizeof(uint64_t))==sizeof(etagBackendSize))
-#else
+    if(::pread(fd,&etagBackendSize,sizeof(etagBackendSize),3*sizeof(uint64_t))!=sizeof(etagBackendSize))
+    {
+        std::cerr << "Unable to pread, errno: " << errno << " " << __FILE__ << ":" << __LINE__ << std::endl;
+        return std::string();
+    }
+    #else
     #ifdef DEBUGFASTCGI
     std::cerr << __FILE__ << ":" << __LINE__ << " Cache::ETagBackend(): " << fd << std::endl;
     #endif
@@ -194,16 +199,16 @@ std::string Cache::ETagBackend() const
         std::cerr << "Unable to read, errno: " << errno << " " << __FILE__ << ":" << __LINE__ << std::endl;
         return std::string();
     }
-#endif
+    #endif
     {
         char buffer[etagBackendSize];
         #ifdef PREADPWRITE
-        if(::pread(fd,buffer,etagBackendSize,3*sizeof(uint64_t)+sizeof(uint8_t))==etagBackendSize)
+        if(::pread(fd,buffer,etagBackendSize,3*sizeof(uint64_t)+sizeof(uint8_t))!=etagBackendSize)
         {
             std::cerr << "Unable to pread, errno: " << errno << " " << __FILE__ << ":" << __LINE__ << std::endl;
             return std::string();
         }
-#else
+        #else
         #ifdef DEBUGFASTCGI
         std::cerr << __FILE__ << ":" << __LINE__ << " Cache::ETagBackend(): " << fd << std::endl;
         #endif
@@ -217,7 +222,7 @@ std::string Cache::ETagBackend() const
             std::cerr << "Unable to read, errno: " << errno << " " << __FILE__ << ":" << __LINE__ << std::endl;
             return std::string();
         }
-#endif
+        #endif
         const std::string &etag=std::string(buffer,etagBackendSize);
         #ifdef DEBUGFASTCGI
         if(etag.find('\0')!=std::string::npos)
@@ -234,8 +239,8 @@ uint16_t Cache::http_code() const
 {
     uint16_t code=0;
     #ifdef PREADPWRITE
-    if(::pread(fd,&time,sizeof(code),2*sizeof(uint64_t))==sizeof(time))
-        return time;
+    if(::pread(fd,&code,sizeof(code),2*sizeof(uint64_t))==sizeof(code))
+        return code;
     else
         std::cerr << "Unable to pread, errno: " << errno << " " << __FILE__ << ":" << __LINE__ << std::endl;
 #else
@@ -544,6 +549,16 @@ ssize_t Cache::read(char * data,const size_t &size)
         std::cerr << __FILE__ << ":" << __LINE__ << " read errno: " << errno << std::endl;
     #endif
     return s;
+}
+
+ssize_t Cache::sendfileTo(const int &out_fd,const size_t &maxBytes)
+{
+    errno=0;
+    if(fd==-1)
+        return -1;
+    // offset=NULL → kernel reads from (and advances) fd's current seek position,
+    // matching the existing read() semantics that callers depend on.
+    return ::sendfile(out_fd,fd,NULL,maxBytes);
 }
 
 uint32_t Cache::timeToCache(uint16_t http_code)

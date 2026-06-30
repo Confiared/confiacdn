@@ -1,6 +1,6 @@
 QT -= gui
 
-CONFIG += c++11 console
+CONFIG += c++17 console
 CONFIG -= app_bundle
 
 # The following define makes your compiler emit warnings if you use
@@ -15,25 +15,27 @@ DEFINES += QT_DEPRECATED_WARNINGS FASTCGIASYNC
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 #DEFINES += DEBUGHTTPS
-LIBS += -lssl -lcrypto
+LIBS += -lssl -lcrypto -lngtcp2 -lnghttp3 -lngtcp2_crypto_ossl -lxxhash
 
 CONFIG(debug, debug|release) {
 DEFINES += DEBUGFASTCGI
 DEFINES += DEBUGDNS
 #DEFINES += DEBUGFILEOPEN
 DEFINES += DEBUGFASTCGITCP
-DEFINES += ONFLYENCODEFASTCGI
 DEFINES += LOWTIMEDNSCACHE
+DEFINES += DEBUGFROMIP
 }
 
 #DEFINES += HOSTSUBFOLDER
 
 SOURCES += main.cpp \
     Client.cpp \
+    ClientReload.cpp \
     Common.cpp \
     DnsSocket.cpp \
     EpollObject.cpp \
     Server.cpp \
+    ServerReload.cpp \
     ServerTCP.cpp \
     Dns.cpp \
     Timer.cpp \
@@ -45,10 +47,12 @@ SOURCES += main.cpp \
 
 HEADERS += \
     Client.hpp \
+    ClientReload.hpp \
     Common.hpp \
     DnsSocket.hpp \
     EpollObject.hpp \
     Server.hpp \
+    ServerReload.hpp \
     ServerTCP.hpp \
     Dns.hpp \
     Timer.hpp \
@@ -58,12 +62,13 @@ HEADERS += \
     Timer/DNSCache.hpp \
     Timer/DNSQuery.hpp
 
-#unable to use curl due to lack of my knowledge of curl signals/timeout
-#DEFINES += CURL
-#LIBS += -lcurl
 SOURCES += Backend.cpp \
     Http.cpp \
-    Https.cpp
+    Https.cpp \
+    Http3.cpp \
+    Http3Probe.cpp
 HEADERS += Backend.hpp \
         Http.hpp \
-        Https.hpp
+        Https.hpp \
+        Http3.hpp \
+        Http3Probe.hpp

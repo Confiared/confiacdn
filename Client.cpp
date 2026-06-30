@@ -7,16 +7,17 @@
 #include <unistd.h>
 #include <iostream>
 #include <string.h>
-//#include <xxhash.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include "xxHash/xxh3.h"
+#include <xxhash.h>
 #include <chrono>
 #include <arpa/inet.h>
 #include <sstream>
 #include <stdio.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <algorithm>
+#include <vector>
 
 //ETag -> If-None-Match
 //debug.m3MM7UcOEr3qP3ZK
@@ -235,7 +236,10 @@ void Client::disconnect()
         {
             time_t timestamp;
             time(&timestamp);
+            #ifdef DEBUGFASTCGI
+            //maybe just BOT detecting header
             std::cerr << this << " time " << ctime(&timestamp) << " closed before end " << bodyAndHeaderFileBytesSended << " " << host << "/" << uri << " " << __FILE__ << ":" << __LINE__ << std::endl;
+            #endif
         }
         #ifdef DEBUGFASTCGI
         std::cerr << this << " fd close: " << fd << " disconnect(), dataToWrite.size(): " << dataToWrite.size() << std::endl;
@@ -265,12 +269,12 @@ void Client::disconnect()
                 if(fstat(readCache->getFD(),&sb)==0)
                 {
                     if(sb.st_size<10000000)
-                        std::cerr << this << " exe cache ultracopier seam too small and cache FD too " << host << "/" << uri << " pathVar " << pathVar << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                        std::cerr << this << " exe cache ultracopier seam too small and cache FD too " << host << "/" << uri << " pathVar " << pathVar << " time since start " << (Common::msFrom1970()-creationTime)/1000 << " " << __FILE__ << ":" << __LINE__ << std::endl;
                     else
-                        std::cerr << this << " exe cache ultracopier size seam ok: " << sb.st_size << " " << host << "/" << uri << " pathVar " << pathVar << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                        std::cerr << this << " exe cache ultracopier size seam ok: " << sb.st_size << " " << host << "/" << uri << " pathVar " << pathVar << " time since start " << (Common::msFrom1970()-creationTime)/1000 << " " << __FILE__ << ":" << __LINE__ << std::endl;
                 }
                 else
-                    std::cerr << this << " exe cache ultracopier unable to stat errno " << errno << " " << host << "/" << uri << " pathVar " << pathVar << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                    std::cerr << this << " exe cache ultracopier unable to stat errno " << errno << " " << host << "/" << uri << " pathVar " << pathVar << " time since start " << (Common::msFrom1970()-creationTime)/1000 << " " << __FILE__ << ":" << __LINE__ << std::endl;
             }
             #ifdef DEBUGFASTCGI
             std::cerr << getStatus() << std::endl;
@@ -307,7 +311,7 @@ void Client::disconnectFromHttp()
              #ifdef DEBUGFROMIP
              << " from " << REMOTE_ADDR
              #endif
-                      << " " << host << "/" << uri << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                      << " " << host << "/" << uri << " " << " time since start " << (Common::msFrom1970()-creationTime)/1000 << __FILE__ << ":" << __LINE__ << std::endl;
             if(http!=nullptr)
                 std::cerr << this << " http: " << http->getQuery() << " " << __FILE__ << ":" << __LINE__ << std::endl;
             #ifdef DEBUGFASTCGI
@@ -536,8 +540,16 @@ void Client::readyToRead()
                     }
                     break;
                     case 10:
+                    if(memcmp(Client::bigStaticReadBuffer+pos,"HTTP_RANGE",varSize)==0)
+                    {
+                        // Captured for client-Range serve from warm cache (frontend Range
+                        // tests). Bound the length defensively — a 64K Range header is
+                        // already absurd; cap at 1024 to keep parsing cheap.
+                        size_t copyLen = valSize > 1024 ? 1024 : (size_t)valSize;
+                        rangeHeader.assign(Client::bigStaticReadBuffer+pos+varSize, copyLen);
+                    }
                     #ifdef DEBUGFASTCGI
-                    if(memcmp(Client::bigStaticReadBuffer+pos,"HTTP_DEBUG",varSize)==0)
+                    else if(memcmp(Client::bigStaticReadBuffer+pos,"HTTP_DEBUG",varSize)==0)
                         std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " HTTP_DEBUG: " << std::string(Client::bigStaticReadBuffer+pos+varSize,valSize) << std::endl;
                     #endif
                     break;
@@ -584,8 +596,30 @@ void Client::readyToRead()
                     break;
                     case 14:
                     if(memcmp(Client::bigStaticReadBuffer+pos,"REQUEST_SCHEME",varSize)==0 && valSize==5)
+                    {
                         if(memcmp(Client::bigStaticReadBuffer+pos+varSize,"https",5)==0)
                             https=true;
+                    }
+                    else if(memcmp(Client::bigStaticReadBuffer+pos,"REQUEST_METHOD",varSize)==0)
+                    {
+                        // Confiacdn is a read-only CDN edge — reject writes before any
+                        // backend connection is opened (mission item 5: never let abusive
+                        // origins or mistaken clients trigger backend work for non-cacheable
+                        // requests; FastCGI already buffered the body so no need to drain).
+                        bool reject=false;
+                        if(valSize==4 && memcmp(Client::bigStaticReadBuffer+pos+varSize,"POST",4)==0) reject=true;
+                        else if(valSize==3 && memcmp(Client::bigStaticReadBuffer+pos+varSize,"PUT",3)==0) reject=true;
+                        else if(valSize==6 && memcmp(Client::bigStaticReadBuffer+pos+varSize,"DELETE",6)==0) reject=true;
+                        else if(valSize==5 && memcmp(Client::bigStaticReadBuffer+pos+varSize,"PATCH",5)==0) reject=true;
+                        if(reject)
+                        {
+                            const char text[]="Status: 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
+                            addHeaderAndWrite(text,sizeof(text)-1);
+                            internalWriteEnd();
+                            disconnect();
+                            return;
+                        }
+                    }
                     break;
                     case 18:
                     if(memcmp(Client::bigStaticReadBuffer+pos,"HTTP_IF_NONE_MATCH",varSize)==0 && valSize==8)
@@ -800,27 +834,9 @@ void Client::readyToRead()
         return;
     }
 
-    /*generate problem
-     * Curl error on https://cdn3.confiared.com/files.first-world.info/ultracopier/2.2.4.12/ultracopier-windows-x86_64-2.2.4.12-setup.exe, curl_errno($ch): 18, curl_getinfo($ch, CURLINFO_HTTP_CODE): 200 SCZ transfer closed with 15537536 bytes remaining to read */
-    //drop buffer in memory, replace by seek from cache file to reduce memory
-    #ifdef FASTCGIASYNC
-    int flags, s;
-    flags = fcntl(fd, F_GETFL, 0);
-    if(flags == -1)
-        std::cerr << "fcntl get flags error" << std::endl;
-    else
-    {
-        flags |= O_NONBLOCK;
-        s = fcntl(fd, F_SETFL, flags);
-        if(s == -1)
-            std::cerr << "fcntl set flags error" << std::endl;
-        #ifdef DEBUGFASTCGI
-        else
-            std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " async set" << std::endl;
-        #endif
-    }
-    #endif
-
+    // Frontend fd is already O_NONBLOCK | O_CLOEXEC — Server*::parseEvent
+    // accepts it with accept4(SOCK_NONBLOCK | SOCK_CLOEXEC), so no per-Client
+    // fcntl is needed.
     Client::loadUrl(host,uri,ifNoneMatch);
 }
 
@@ -1048,13 +1064,18 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
         //then don't touch folderVar
         //folderVar[6]='\0';
 
-        XXH3_state_t state;
-        XXH3_64bits_reset(&state);
+        // System libxxhash hides the state struct's layout; use the
+        // heap-allocated public API. Allocation is small (~570 bytes,
+        // SIMD-aligned) and happens once per request — well below the
+        // existing per-request work budget.
+        XXH3_state_t *state = XXH3_createState();
+        XXH3_64bits_reset(state);
         if(https)
-            XXH3_64bits_update(&state, "S",1);
-        XXH3_64bits_update(&state, host.data(),host.size());
-        XXH3_64bits_update(&state, uri.data(),uri.size());
-        const XXH64_hash_t &hashuri=XXH3_64bits_digest(&state);
+            XXH3_64bits_update(state, "S",1);
+        XXH3_64bits_update(state, host.data(),host.size());
+        XXH3_64bits_update(state, uri.data(),uri.size());
+        const XXH64_hash_t hashuri=XXH3_64bits_digest(state);
+        XXH3_freeState(state);
 
         Common::binarytoHexaC64Bits(reinterpret_cast<const char *>(&hashuri),pathVar);
         if(gzip)
@@ -1279,20 +1300,66 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
                 http_code=500;
             }
             //last modification time check <24h or in future to prevent time drift
-            const uint64_t &currentTime=time(NULL);
-            if(lastModificationTimeCheck>currentTime)
+            // lastModificationTimeCheck is stored in milliseconds (see Http.cpp where it's
+            // set to Common::msFrom1970()); compare in milliseconds so the TTL boundary
+            // (--http200Time) can be observed at sub-second precision.
+            const uint64_t currentTime=time(NULL);
+            const uint64_t currentTimeMs=Common::msFrom1970();
+            // Cache header sanity check: a file whose lmtc is wildly out of bounds, or
+            // whose http_code isn't a valid HTTP status, is likely corrupt (e.g. a
+            // partial write, or an attacker / fuzzed file in the cache dir). Treat as
+            // a miss rather than serving garbage to clients — also prevents corrupted
+            // FastCGI bytes from reaching nginx ("unsupported FastCGI protocol version").
+            const uint64_t maxFutureDriftMs = 24ULL*3600ULL*1000ULL;
+            const uint64_t maxAgeMs = 30ULL*365ULL*24ULL*3600ULL*1000ULL;
+            const bool lmtcUnreasonable =
+                (lastModificationTimeCheck > currentTimeMs + maxFutureDriftMs) ||
+                (currentTimeMs > maxAgeMs && lastModificationTimeCheck != 0 &&
+                 lastModificationTimeCheck < currentTimeMs - maxAgeMs);
+            const bool httpCodeUnreasonable = (http_code < 100 || http_code >= 600);
+            if(lmtcUnreasonable || httpCodeUnreasonable)
             {
                 #ifdef DEBUGFASTCGI
-                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " lastModificationTimeCheck>currentTime, time drift?" << std::endl;
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " " << pathForIndex
+                          << " cache header sanity fail (lmtc=" << lastModificationTimeCheck
+                          << " http_code=" << http_code << "), treat as miss" << std::endl;
                 #endif
-                lastModificationTimeCheck=currentTime;
+                if(cachefd!=-1)
+                    ::close(cachefd);
+                cachefd=-1;
+                ::unlink(pathVar);
+                #ifdef HOSTSUBFOLDER
+                ::mkdir(folderVar,S_IRWXU);
+                #endif
+                createHttpBackend();
+                return;
             }
-            if(lastModificationTimeCheck>(currentTime-Cache::timeToCache(http_code)))
+            const uint64_t timeToCacheMs=(uint64_t)Cache::timeToCache(http_code)*1000ULL;
+            if(lastModificationTimeCheck>currentTimeMs)
+            {
+                #ifdef DEBUGFASTCGI
+                std::cerr << __FILE__ << ":" << __LINE__ << " " << this << " lastModificationTimeCheck>currentTimeMs, time drift?" << std::endl;
+                #endif
+                lastModificationTimeCheck=currentTimeMs;
+            }
+            if(lastModificationTimeCheck+timeToCacheMs>currentTimeMs)
             {
                 //from cache load (too recent to check)
                 #ifdef DEBUGFASTCGI
                 std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << std::endl;
                 #endif
+                // Frontend Range: if the client sent Range and the cache is fresh,
+                // serve a slice as 206 directly (or 416 if out of range). Malformed
+                // Range header → falls through to normal 200 serve.
+                if(!rangeHeader.empty())
+                {
+                    if(serveRangeFromWarmCache(cachefd))
+                    {
+                        if(cachefd!=-1) ::close(cachefd);
+                        cachefd=-1;
+                        return;
+                    }
+                }
                 if(readCache!=nullptr)
                 {
                     delete readCache;
@@ -1327,7 +1394,7 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
                 std::cerr << "Client::loadUrl(), readCache close: " << cachefd << ", " << __FILE__ << ":" << __LINE__ << std::endl;
                 #endif
                 #ifdef DEBUGFASTCGI
-                std::cerr << lastModificationTimeCheck << ">(" << currentTime << "-" << Cache::timeToCache(http_code) << ") " << "close() fd: " << cachefd << " " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
+                std::cerr << lastModificationTimeCheck << "+" << timeToCacheMs << "<=" << currentTimeMs << "ms close() fd: " << cachefd << " " << this << " " << __FILE__ << ":" << __LINE__ << std::endl;
                 #endif
                 //without the next line descriptor lost, generate: errno 24 (Too many open files)
                 if(cachefd!=-1)
@@ -1354,7 +1421,15 @@ void Client::loadUrl(const std::string &host, const std::string &uri, const std:
         /* this case is used when:
          * Http add client: this client fd: X isAlive: 1 getEndDetected(): 1 getFileMoved(): 1
          * when the file was downloaded fully, but uploading to another client */
-        if(http->headerWriten || http->getEndDetected() || http->getFileMoved())
+        // http may have been nulled out as a side-effect of addClient() above —
+        // e.g. addClient hits the "dead http" branch and triggers httpError →
+        // disconnect() → Http::removeClient sets client->http = nullptr. Without
+        // this guard, high-rate flapping (many clients churning through the
+        // de-dup join path) trips a UBSan null-deref here (multi_client_high_rate
+        // _flapping_stress crash). The Client is already being disconnected, so
+        // there's nothing to do.
+        if(http!=nullptr &&
+           (http->headerWriten || http->getEndDetected() || http->getFileMoved()))
             startRead(pathVar,true);
     }
 }
@@ -1575,8 +1650,11 @@ void Client::createHttpBackend()
             if(::pread(cachefd,&http_code,sizeof(http_code),2*sizeof(uint64_t))!=sizeof(http_code))
                 http_code=500;
             //last modification time check <24h or in future to prevent time drift
-            const uint64_t &currentTime=time(NULL);
-            if(lastModificationTimeCheck>(currentTime-Cache::timeToCache(http_code)))
+            // see loadUrl above: lmtc is stored in milliseconds for sub-second TTL precision.
+            const uint64_t currentTime=time(NULL);
+            const uint64_t currentTimeMs=Common::msFrom1970();
+            const uint64_t timeToCacheMs=(uint64_t)Cache::timeToCache(http_code)*1000ULL;
+            if(lastModificationTimeCheck+timeToCacheMs>currentTimeMs)
             {
                 #ifdef DEBUGFASTCGI
                 std::cerr << __FILE__ << ":" << __LINE__ << " " << this << std::endl;
@@ -1820,6 +1898,15 @@ bool Client::startRead(const std::string &path, const bool &partial)
     errno=0;
     int cachefd = ::open(path.c_str(), O_RDWR | O_NOCTTY/* | O_NONBLOCK*/, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     const int temperrno=errno;
+    if(cachefd>=0)
+    {
+        // Tell the kernel we'll stream the body sequentially via sendfile so it
+        // can do larger readahead. The cache-header pread()s before
+        // seekToContentPos are random-access but cheap (≤25 bytes total) — the
+        // hint pays off on the body, which dominates wall time on cold-page-
+        // cache 10 MB / 100 MB hits.
+        ::posix_fadvise(cachefd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    }
     //if failed open cache
     if(cachefd==-1)
     {
@@ -1969,7 +2056,11 @@ void Client::continueRead()
     Http::checkIngrityHttpClient();
     std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
     #endif
-    char buffer[65535-1000];//fastcgi is limited to 65535-1000 size
+    // Per-call cap on sendfile. The cache file already contains FastCGI-framed
+    // bytes, so the kernel doesn't need to respect the 64KB FastCGI record
+    // boundary — set this large enough that one syscall typically fills the
+    // socket buffer and the per-response syscall count drops to ~1 per drain.
+    static constexpr size_t sendfileChunk=1<<20;//1 MiB
     do {
         if(readCache==nullptr)
         {
@@ -1978,7 +2069,45 @@ void Client::continueRead()
             #endif
             return;
         }
-        const ssize_t &s=readCache->read(buffer,sizeof(buffer));
+        // Linux zero-copy: stream from the cache file straight into the FastCGI
+        // socket without bouncing through user space. The cache file already
+        // contains FCGI_STDOUT-framed bytes (status+headers record, then body
+        // chunks, then END_REQUEST), so we just blast the kernel offset forward.
+        // EAGAIN means the socket is full — return and let EPOLLOUT
+        // (readyToWrite -> continueRead) resume from the same seek pos.
+        if(!dataToWrite.empty())
+        {
+            #ifdef DEBUGFASTCGI
+            std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " sendfile path: dataToWrite not empty, defer" << std::endl;
+            #endif
+            return;
+        }
+        errno=0;
+        const ssize_t s=readCache->sendfileTo(fd,sendfileChunk);
+        const int sendfileErrno=errno;
+        if(s<0)
+        {
+            if(sendfileErrno==EAGAIN || sendfileErrno==EWOULDBLOCK)
+            {
+                #ifdef DEBUGFASTCGI
+                std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " sendfile EAGAIN, wait EPOLLOUT" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
+                #endif
+                return;
+            }
+            if(sendfileErrno!=EPIPE)//EPIPE: peer closed; quiet, like the write() path
+            {
+                switch(sendfileErrno)
+                {
+                    case ECONNRESET:
+                        std::cerr << fd << ") sendfile error: " << sendfileErrno << " ECONNRESET Connection reset by peer" << std::endl;
+                        break;
+                    default:
+                        std::cerr << fd << ") sendfile error: " << sendfileErrno << std::endl;
+                }
+            }
+            disconnect();
+            return;
+        }
         #ifdef DEBUGFASTCGI
         //std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " continueRead(): " << s << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
         #endif
@@ -2067,19 +2196,12 @@ void Client::continueRead()
         }
         else
             bodyAndHeaderFileBytesSended+=s;
-        write(buffer,s);
+        // sendfile already pushed s bytes onto the FastCGI socket; mirror the
+        // bytesSended/keepalive bookkeeping that Client::write() did in the
+        // pre-sendfile path.
         #ifdef DEBUGFASTCGI
-        //std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this->fd << " " << this << " continueRead(): " << s << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
-        #endif
-        //if can't write all
-        if(!dataToWrite.empty())
-        {
-            #ifdef DEBUGFASTCGI
-            std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " client TCP buffer statured, return to wait buffer is empty" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << ", remain to write: " << dataToWrite.size() << " time: " << Common::msFrom1970() << std::endl;
-            #endif
-            return;
-        }
-        #ifdef DEBUGFASTCGI
+        bytesSended+=s;
+        creationTimeOrUpdate=Common::msFrom1970();
         std::cerr << __FILE__ << ":" << __LINE__ << " fd: " << fd << " this->fd: " << this << " end of read loop;" << " fileBytesSended: " << bodyAndHeaderFileBytesSended << std::endl;
         #endif
         //if can write all, try again
@@ -2205,6 +2327,206 @@ void Client::httpError(const std::string &errorString)
             "Status: 500 Internal Server Error\r\nX-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\nError: "+
             errorString;
     addHeaderAndWrite(fullContent.data(),fullContent.size());
+    internalWriteEnd();
+    disconnect();
+}
+
+void Client::sendRedirectResponse(const std::string &response)
+{
+    // Forward an origin 3xx response (already serialized by caller into the
+    // FastCGI/CGI status+headers form). One-shot: emit, end, disconnect.
+    addHeaderAndWrite(response.data(),(int)response.size());
+    internalWriteEnd();
+    disconnect();
+}
+
+// Serve a slice of a warm-cache file as 206 Partial Content. The cache file is
+// laid out as: [25-byte header][backend etag (variable)][FastCGI STDOUT records
+// containing the original HTTP headers, then body chunks][FastCGI END_REQUEST].
+// We parse the headers record to learn Content-Type / Content-Length, then walk
+// the body chunks to pick out [rangeStart, rangeEnd] and re-emit it as 206.
+//
+// Out-of-range → 416 with `Content-Range: bytes */<total>`.
+// Malformed Range → return false, caller falls through to normal 200 serve.
+bool Client::serveRangeFromWarmCache(int cachefd)
+{
+    if(rangeHeader.empty()) return false;
+    if(cachefd<0) return false;
+
+    // Quick syntactic check on Range header. Spec is "Range: bytes=N-" or
+    // "bytes=N-M". Anything else (including "bytes=foo") is malformed → fall back.
+    if(rangeHeader.size()<7 || rangeHeader.compare(0,6,"bytes=")!=0)
+        return false;
+    const std::string spec=rangeHeader.substr(6);
+    const size_t dash=spec.find('-');
+    if(dash==std::string::npos)
+        return false;
+    int64_t rangeStart=-1, rangeEnd=-1;
+    {
+        const std::string lo=spec.substr(0,dash);
+        const std::string hi=spec.substr(dash+1);
+        try {
+            rangeStart=lo.empty() ? 0 : std::stoll(lo);
+        } catch(...) { return false; }
+        if(!hi.empty())
+        {
+            try {
+                rangeEnd=std::stoll(hi);
+            } catch(...) { return false; }
+        }
+        // else rangeEnd stays -1 (open-ended); resolved against contentLength below.
+        if(rangeStart<0) return false;
+        if(rangeEnd>=0 && rangeEnd<rangeStart) return false;
+    }
+
+    // Read cache header to find FastCGI stream offset.
+    uint8_t etagBackendSize=0;
+    if(::pread(cachefd,&etagBackendSize,1,3*sizeof(uint64_t))!=1)
+        return false;
+    const off_t fcgiStart=(off_t)(3*sizeof(uint64_t))+1+etagBackendSize;
+
+    // First STDOUT record carries the HTTP headers ("Status: 200 OK\r\n...\r\n\r\n").
+    char fcgiHdr[8];
+    if(::pread(cachefd,fcgiHdr,8,fcgiStart)!=8)
+        return false;
+    if((uint8_t)fcgiHdr[1]!=6)  // FCGI_STDOUT
+        return false;
+    const uint16_t hdrSize=((uint16_t)(uint8_t)fcgiHdr[4]<<8)|(uint8_t)fcgiHdr[5];
+    const uint8_t hdrPad=(uint8_t)fcgiHdr[6];
+    if(hdrSize==0)
+        return false;
+    std::string headers(hdrSize,'\0');
+    if(::pread(cachefd,&headers[0],hdrSize,fcgiStart+8)!=(ssize_t)hdrSize)
+        return false;
+
+    std::string contentType="application/octet-stream";
+    int64_t contentLength=-1;
+    {
+        size_t pos=0;
+        while(pos<headers.size())
+        {
+            const size_t lineEnd=headers.find('\n',pos);
+            if(lineEnd==std::string::npos) break;
+            std::string line=headers.substr(pos,lineEnd-pos);
+            if(!line.empty() && line.back()=='\r') line.pop_back();
+            if(line.empty()) break;
+            const size_t colon=line.find(':');
+            if(colon!=std::string::npos)
+            {
+                std::string name=line.substr(0,colon);
+                std::transform(name.begin(),name.end(),name.begin(),
+                               [](unsigned char c){return (char)std::tolower(c);});
+                std::string value=line.substr(colon+1);
+                while(!value.empty() && value.front()==' ') value.erase(0,1);
+                if(name=="content-type") contentType=value;
+                else if(name=="content-length")
+                {
+                    try { contentLength=std::stoll(value); } catch(...) {}
+                }
+            }
+            pos=lineEnd+1;
+        }
+    }
+    if(contentLength<0)
+        return false;  // can't honour Range without total size
+
+    // Resolve open-ended Range and detect 416.
+    if(rangeEnd<0) rangeEnd=contentLength-1;
+    if(rangeStart>=contentLength)
+    {
+        std::string resp("Status: 416 Range Not Satisfiable\r\n");
+        resp+="Content-Range: bytes */"+std::to_string(contentLength)+"\r\n";
+        resp+="Content-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
+        addHeaderAndWrite(resp.data(),(int)resp.size());
+        internalWriteEnd();
+        disconnect();
+        return true;
+    }
+    if(rangeEnd>=contentLength) rangeEnd=contentLength-1;
+    const int64_t sliceLen=rangeEnd-rangeStart+1;
+
+    // Emit 206 status and headers as a single FastCGI STDOUT record.
+    {
+        std::string resp("Status: 206 Partial Content\r\n");
+        resp+="Content-Type: "+contentType+"\r\n";
+        resp+="Content-Length: "+std::to_string(sliceLen)+"\r\n";
+        resp+="Content-Range: bytes "+std::to_string(rangeStart)+"-"+
+              std::to_string(rangeEnd)+"/"+std::to_string(contentLength)+"\r\n\r\n";
+        addHeaderAndWrite(resp.data(),(int)resp.size());
+    }
+
+    // Walk body chunks, pulling out the slice. Each subsequent FastCGI STDOUT
+    // record holds a chunk of the body; we skip those wholly before rangeStart,
+    // partially-emit chunks straddling rangeStart or rangeEnd, and stop at rangeEnd.
+    off_t readPos=fcgiStart+8+(off_t)hdrSize+(off_t)hdrPad;
+    int64_t bodyConsumed=0;
+    int64_t bytesEmitted=0;
+    static constexpr int kMaxFcgiPayload=65535-1000;  // matches addHeaderAndWrite cap
+    std::vector<char> buf;
+    while(bytesEmitted<sliceLen)
+    {
+        char chunkHdr[8];
+        const ssize_t r=::pread(cachefd,chunkHdr,8,readPos);
+        if(r!=8) break;
+        if((uint8_t)chunkHdr[1]!=6) break;  // not STDOUT (END_REQUEST or unknown)
+        const uint16_t chunkSize=((uint16_t)(uint8_t)chunkHdr[4]<<8)|(uint8_t)chunkHdr[5];
+        const uint8_t chunkPad=(uint8_t)chunkHdr[6];
+        if(chunkSize==0) break;  // zero-size STDOUT marks end of stream
+        const off_t chunkBodyOff=readPos+8;
+        readPos=chunkBodyOff+chunkSize+chunkPad;
+        const int64_t chunkBodyEnd=bodyConsumed+(int64_t)chunkSize;
+        // intersect [rangeStart, rangeEnd] with [bodyConsumed, chunkBodyEnd)
+        const int64_t skipFront=std::max((int64_t)0, rangeStart-bodyConsumed);
+        const int64_t takeUntil=std::min((int64_t)chunkSize, rangeEnd+1-bodyConsumed);
+        if(takeUntil>skipFront)
+        {
+            const int64_t toEmit=takeUntil-skipFront;
+            if((int64_t)buf.size()<toEmit) buf.resize((size_t)toEmit);
+            if(::pread(cachefd,buf.data(),(size_t)toEmit,chunkBodyOff+skipFront)!=(ssize_t)toEmit)
+                break;
+            int64_t emitOff=0;
+            while(emitOff<toEmit)
+            {
+                const int64_t chunkLen=std::min((int64_t)kMaxFcgiPayload,toEmit-emitOff);
+                addHeaderAndWrite(buf.data()+(size_t)emitOff,(int)chunkLen);
+                emitOff+=chunkLen;
+            }
+            bytesEmitted+=toEmit;
+        }
+        bodyConsumed=chunkBodyEnd;
+        if(bodyConsumed>rangeEnd) break;
+    }
+    internalWriteEnd();
+    disconnect();
+    return true;
+}
+
+void Client::httpStatus(const int &code)
+{
+    // Propagate an origin status code to the client verbatim. Used when the
+    // origin returned a non-2xx response that is not a recoverable revalidate
+    // (304) and we have no stale cache to fall back to.
+    const char *reason="Error";
+    switch(code) {
+        case 400: reason="Bad Request"; break;
+        case 401: reason="Unauthorized"; break;
+        case 403: reason="Forbidden"; break;
+        case 404: reason="Not Found"; break;
+        case 405: reason="Method Not Allowed"; break;
+        case 410: reason="Gone"; break;
+        case 451: reason="Unavailable For Legal Reasons"; break;
+        case 500: reason="Internal Server Error"; break;
+        case 501: reason="Not Implemented"; break;
+        case 502: reason="Bad Gateway"; break;
+        case 503: reason="Service Unavailable"; break;
+        case 504: reason="Gateway Timeout"; break;
+    }
+    char buffer[256];
+    const int n=snprintf(buffer,sizeof(buffer),
+        "Status: %d %s\r\nX-Robots-Tag: noindex, nofollow\r\nContent-type: text/plain\r\n\r\n",
+        code,reason);
+    if(n>0 && static_cast<size_t>(n)<sizeof(buffer))
+        addHeaderAndWrite(buffer,n);
     internalWriteEnd();
     disconnect();
 }

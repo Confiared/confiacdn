@@ -62,6 +62,11 @@ private:
     void remoteSocketClosedInternal();
     static Backend * tryConnectInternalList(const sockaddr_in6 &s, Http *http, std::unordered_map<std::string, BackendList *> &addressToList, bool &connectInternal, BackendList **backendList);
     void startHttps();
+    // Detach the currently attached Http and route the failure through
+    // Http::backendErrorAndDisconnect so clients get a 5xx without waiting
+    // for --maxreadtime to expire. Used from the SSL_connect failure paths
+    // in startHttps (any non-HTTP failure should fail-fast, not idle out).
+    void failAttachedHttp(const std::string &reason);
     void downloadFinishedInternal();
     bool tryConnectInternal(const sockaddr_in6 &s);
     void startNextPending();

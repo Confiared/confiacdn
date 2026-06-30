@@ -16,6 +16,9 @@ public:
         Kind_Timer,
         Kind_Cache,
         Kind_ServerTCP,
+        Kind_ServerReload,
+        Kind_ClientReload,
+        Kind_Http3,
     };
     EpollObject();
     EpollObject(const int fd,const Kind kind);
